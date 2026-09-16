@@ -11,6 +11,7 @@ import {
   ScanLine,
   Menu,
   type LucideIcon,
+  FileWarningIcon,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -33,7 +34,7 @@ type NavItem = {
 const navItems: NavItem[] = [
   { label: "Home", icon: LayoutDashboard, path: "/home" },
   { label: "History", icon: History, path: "/history" },
-  { label: "Register", icon: ClipboardCheck, path: "/register" },
+  { label: "Complaints", icon: FileWarningIcon, path: "/complaints" },
   { label: "Profile", icon: UserRound, path: "/profile" },
 ];
 

@@ -53,7 +53,7 @@ export default function ProfilePage() {
     const checkBackendStatus = async () => {
         setHealthLoading(true);
         try {
-            const res = await fetch("http://localhost:8000/api/health");
+            const res = await fetch("http://localhost:8000/api/v1/health");
             const data = await res.json();
             setSystemStatus({
                 backend: data.status === "ok",
@@ -271,7 +271,7 @@ export default function ProfilePage() {
                 <Button variant="outline" className="border-rose-200 text-rose-600 hover:bg-rose-50 hover:text-rose-700" onClick={handleLogout}>
                     <LogOut className="h-4 w-4 mr-2" /> Sign Out
                 </Button>
-                <Button variant="ghost" className="text-slate-500" onClick={() => router.push("/")}>Back to Dashboard</Button>
+                <Button variant="ghost" className="text-slate-500" onClick={() => router.back()}>Back to Dashboard</Button>
             </div>
         </div>
     );

@@ -1,29 +1,35 @@
 # backend/app/services/rules.py
 """
-LexMetra — Deterministic LMPC rule engine (v4 — camelCase).
+LexMetra — Deterministic LMPC rule engine (v6 — robust + missing-evidence safe).
 
 Loads rules/lmpc_rules.yaml and evaluates canonical product facts.
 
 Principles (never violate):
   - AI extracts. Rules decide.
   - Missing evidence is NEVER automatically FAIL unless the rule
-    explicitly declares `onMissing: FAIL`.
+    explicitly declares `onMissing: FAIL` or the validator sets
+    `failAction: FAIL` for the missing path.
   - Low-confidence evidence becomes UNCERTAIN, never FAIL.
   - API_UNAVAILABLE / verification failure becomes UNCERTAIN.
   - Exemptions take precedence over applicability.
   - Rules are data-driven; this file contains logic, not policy.
 
-v4 vs v3:
-  - camelCase end to end. YAML, facts, validator type names, and
-    engine internals all use the same casing.
-  - No _to_snake / _to_camel / _normalize_facts. What the extractor
-    produces is what the engine reads.
+v6 vs v5 (missing-evidence pass):
+  - numeric validators do not FAIL on absent fields (P0-A).
+  - _derive_facts() fills netQuantityMeasuredBy / containsLiquid
+    / commodityPhysicalState fallbacks before evaluation (P0-B).
+  - manualReview honours failAction (P1-A).
+  - informational findings do not affect overallStatus (P1-B).
+  - verification adapter keys alias gst <-> gstin (P1-C).
+  - ruleset loader warns about appliesWhen keys with no producer (P1-D).
 """
 from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from datetime import date, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -45,49 +51,156 @@ EXEMPT = "EXEMPT"
 
 _ALL_STATUSES = (PASS, FAIL, UNCERTAIN, NOT_APPLICABLE, EXEMPT)
 
-#: Keys that gate applicability but are frequently absent from extractor
-#: output because they describe the inspection context rather than the
-#: package. If a rule declares one of these and it isn't in facts, we
-#: assume the rule still applies rather than silently disabling it.
 _SOFT_APPLICABILITY_KEYS = frozenset({
     "saleType",
     "productCategory",
     "productSubcategory",
-    "commodityType",
-    "commodityTypeIn",
-    "commodityTypeNotIn",
-    "commodityTypeMatches",
-    "netQuantityMeasuredBy",
-    "packageType",
-    "otherLawApplies",
-    "containsLiquid",
-    "hasOuterWrapper",
-    "dimensionsOrWeightAffectPrice",
-    "commodityTypeInFourthSchedule",
-    "manufacturedOutsideIndia",
-    "packedInIndia",
-    "originallyMarkedExport",
-    "beingSoldInIndia",
 })
 
-#: Defaults for context fields when they are missing from the incoming facts.
 _CONTEXT_DEFAULTS = {
     "saleType": "retail",
     "productCategory": "other",
+}
+
+#: Canonical unit -> measurement family. Used by _derive_facts to fill
+#: `netQuantityMeasuredBy` when the extractor gives us a unit but not
+#: the family.
+_UNIT_FAMILY = {
+    "g": "weight", "kg": "weight", "mg": "weight",
+    "ml": "volume", "l": "volume", "cl": "volume",
+    "mm": "length", "cm": "length", "m": "length",
+    "cm2": "area", "dm2": "area", "m2": "area",
+    "n": "number", "u": "number",
+}
+
+#: Physical states that imply a liquid (or liquid component) is present.
+_LIQUID_STATES = frozenset({"liquid", "solidandliquidmix", "viscous"})
+
+#: Recognised keys for `appliesWhen` — used for debug logging and for
+#: the loader-time "no producer" warning.
+_KNOWN_APPLIES_KEYS = frozenset({
+    "saleType", "productCategory", "productSubcategory",
+    "commodityType", "commodityTypeIn", "commodityTypeNotIn",
+    "commodityTypeMatches", "commodityTypeInFourthSchedule",
+    "isImported", "manufacturedOutsideIndia", "packedInIndia",
+    "packageCapacityAtMost", "packageType",
+    "netQuantityMeasuredBy",
+    "otherLawApplies", "containsLiquid", "hasOuterWrapper",
+    "commodityVariesWithEnvironment",
+    "dimensionsOrWeightAffectPrice",
+    "originallyMarkedExport", "beingSoldInIndia",
+    "retailerRegisteredUnderVatOrTot",
+    "transactionSalePriceKnown",
+    "advertisementMentionsPrice",
+    "packedByEstablishmentType",
+    "coveredByDpco",
+    "specialCase",
+    "productName", "brand", "genericName", "commonName",
+    "mrp", "netQuantityValue", "netQuantityUnit",
+    "netQuantityNumeralHeightMm", "letterHeightMm",
+    "pdpAreaCm2", "finishedDimensions",
+})
+
+#: Facts the extractor emits directly (or that _derive_facts synthesises).
+#: Any appliesWhen key NOT in this set triggers a loader warning.
+_PRODUCIBLE_FACTS = frozenset({
+    "saleType", "productCategory", "productSubcategory",
+    "productName", "brand", "genericName", "commonName",
+    "commodityType", "commodityPhysicalState",
+    "manufacturer", "manufacturerAddress",
+    "packer", "packerAddress",
+    "importer", "importerAddress", "countryOfOrigin",
+    "mrp", "netQuantityValue", "netQuantityUnit",
+    "netQuantityRawText", "mrpRawText",
+    "batchNumber", "manufacturedDate", "packedDate", "importedDate",
+    "expiryDate", "bestBeforeDate",
+    "fssaiLicense", "ingredients",
+    "customerCare", "customerCarePhone", "customerCareEmail",
+    "customerCareAddress", "website", "productCode",
+    "declarationLanguage", "declarationOnPdp",
+    "finishedDimensions", "usableSheetsCount", "sheetDimensions",
+    # derived by _derive_facts:
+    "netQuantityMeasuredBy", "containsLiquid", "isImported",
+    # injected by the router before evaluate():
+    "inspectionDate",
+    # structural inspection context (may be set by upload / UI):
+    "saleType",
+})
+
+#: Recognised "special cases" — named predicates that have no direct fact.
+_SPECIAL_CASES: dict[str, Callable[[dict], bool]] = {
+    "domesticLpgCylinder14_2kg": lambda f: False,
+    "domesticLpgCylinder5kg": lambda f: False,
+    "domesticLpgCylinderAdministrativePrice": lambda f: False,
+}
+
+# Unit aliases — normalise common spellings to canonical form.
+_UNIT_ALIASES = {
+    "gram": "g", "grams": "g", "gm": "g", "gms": "g",
+    "kilogram": "kg", "kilograms": "kg", "kgs": "kg",
+    "milligram": "mg", "milligrams": "mg",
+    "millilitre": "ml", "milliliter": "ml",
+    "millilitres": "ml", "milliliters": "ml",
+    "litre": "l", "liter": "l", "litres": "l", "liters": "l", "lt": "l",
+    "centimetre": "cm", "centimeter": "cm",
+    "centimetres": "cm", "centimeters": "cm",
+    "millimetre": "mm", "millimeter": "mm",
+    "millimetres": "mm", "millimeters": "mm",
+    "metre": "m", "meter": "m", "metres": "m", "meters": "m",
+    "sqcm": "cm2", "sq cm": "cm2", "cm²": "cm2", "cm^2": "cm2",
+    "sqm": "m2", "sq m": "m2", "m²": "m2", "m^2": "m2",
+    "dm²": "dm2", "dm^2": "dm2",
+    "number": "n", "count": "u",
 }
 
 
 # ============================================================
 # LOADER
 # ============================================================
-def load_ruleset(path: Optional[Path] = None) -> dict:
-    p = path or RULES_PATH
+@lru_cache(maxsize=4)
+def _load_ruleset_cached(path_str: str) -> dict:
+    p = Path(path_str)
     if not p.exists():
         raise FileNotFoundError(f"Ruleset not found: {p}")
     data = yaml.safe_load(p.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
         raise ValueError("ruleset must contain a top-level 'rules' list")
+    _warn_unproducible_applies(data)
     return data
+
+
+def _warn_unproducible_applies(ruleset: dict) -> None:
+    """
+    P1-D: warn at load time about appliesWhen keys that no producer
+    supplies and that no special-case handler covers. Those rules are
+    permanently dead.
+    """
+    seen: set[str] = set()
+    for rule in ruleset.get("rules", []) or []:
+        conds = rule.get("appliesWhen") or {}
+        if not isinstance(conds, dict):
+            continue
+        for k in conds:
+            if k in _PRODUCIBLE_FACTS or k in _SPECIAL_CASES:
+                continue
+            if k in seen:
+                continue
+            seen.add(k)
+            logger.warning(
+                "ruleset: appliesWhen key %r has no known producer; "
+                "any rule gated on it will never fire (first seen on %s)",
+                k, rule.get("id"),
+            )
+
+
+def load_ruleset(path: Optional[Path] = None) -> dict:
+    p = path or RULES_PATH
+    return _load_ruleset_cached(str(p))
+
+
+def clear_ruleset_cache() -> None:
+    """Call after editing the YAML during development."""
+    _load_ruleset_cached.cache_clear()
 
 
 # ============================================================
@@ -100,7 +213,7 @@ def _is_present(v: Any) -> bool:
     return s not in ("", "null", "none", "n/a", "na", "undefined")
 
 
-def _first_present(facts: dict, spec: str) -> Any:
+def _first_present(facts: dict, spec: Optional[str]) -> Any:
     if spec is None:
         return None
     if "|" in spec:
@@ -133,6 +246,58 @@ def _number(v: Any) -> Optional[float]:
         return None
 
 
+def _normalise_unit(u: Any) -> str:
+    if u is None:
+        return ""
+    s = unicodedata.normalize("NFKC", str(u)).strip().lower()
+    s = s.replace("²", "2").replace("³", "3")
+    return _UNIT_ALIASES.get(s, s)
+
+
+def _word_in(needle: str, haystack: str, case_insensitive: bool = True) -> bool:
+    if case_insensitive:
+        needle = needle.lower()
+        haystack = haystack.lower()
+    pattern = r"(?<![A-Za-z0-9])" + re.escape(needle) + r"(?![A-Za-z0-9])"
+    return re.search(pattern, haystack) is not None
+
+
+# ============================================================
+# P0-B: FACT DERIVATION
+# ============================================================
+def _derive_facts(facts: dict) -> dict:
+    """
+    Fill in facts that the rule engine needs but the extractor does not
+    (and should not) emit directly. Only fills when absent — never
+    overwrites an explicit value from the caller.
+    """
+    facts = dict(facts)
+
+    # netQuantityMeasuredBy — R7-2, R12-2 depend on this.
+    if facts.get("netQuantityMeasuredBy") is None:
+        unit = _normalise_unit(facts.get("netQuantityUnit"))
+        family = _UNIT_FAMILY.get(unit)
+        if family:
+            facts["netQuantityMeasuredBy"] = family
+
+    # containsLiquid — R9-2 depends on this.
+    if facts.get("containsLiquid") is None:
+        state = str(facts.get("commodityPhysicalState") or "").strip().lower()
+        if state:
+            facts["containsLiquid"] = state in _LIQUID_STATES
+
+    # isImported — if we have a country of origin that isn't India,
+    # or an importer, treat as imported.
+    if facts.get("isImported") is None:
+        coo = str(facts.get("countryOfOrigin") or "").strip().lower()
+        has_importer = _is_present(facts.get("importer"))
+        facts["isImported"] = bool(
+            has_importer or (coo and coo not in ("india", "bharat", "in"))
+        )
+
+    return facts
+
+
 # ============================================================
 # APPLICABILITY
 # ============================================================
@@ -144,12 +309,49 @@ def _rule_applies(rule: dict, facts: dict) -> bool:
             continue
 
         if k == "isImported":
-            actual = bool(
-                _is_present(facts.get("countryOfOrigin"))
-                or _is_present(facts.get("importer"))
-            )
+            actual = bool(facts.get("isImported"))
+
+        elif k == "commodityTypeIn":
+            actual = facts.get("commodityType")
+            if actual is None:
+                return False
+            if isinstance(expected, list):
+                if actual not in expected:
+                    return False
+            elif actual != expected:
+                return False
+            continue
+
+        elif k == "commodityTypeNotIn":
+            actual = facts.get("commodityType")
+            if actual is None:
+                if rule.get("commodityTypeNotInMissing") == "pass":
+                    continue
+                return False
+            if isinstance(expected, list):
+                if actual in expected:
+                    return False
+            elif actual == expected:
+                return False
+            continue
+
+        elif k == "commodityTypeMatches":
+            haystack = str(facts.get("commodityType") or "").lower()
+            if not any(str(needle).lower() in haystack for needle in expected):
+                return False
+            continue
+
+        elif k == "specialCase":
+            predicate = _SPECIAL_CASES.get(str(expected))
+            if predicate is None or not predicate(facts):
+                return False
+            continue
+
         else:
             actual = facts.get(k)
+            if k not in _KNOWN_APPLIES_KEYS:
+                logger.debug("appliesWhen: unknown key %r on rule %s",
+                             k, rule.get("id"))
 
         if actual is None and k in _SOFT_APPLICABILITY_KEYS:
             default = _CONTEXT_DEFAULTS.get(k)
@@ -168,6 +370,42 @@ def _rule_applies(rule: dict, facts: dict) -> bool:
     return True
 
 
+# ============================================================
+# EXEMPTION
+# ============================================================
+def _evaluate_exempt_condition(cond: dict, facts: dict) -> bool:
+    for kk, vv in cond.items():
+        if vv == "any":
+            continue
+
+        if kk == "commodityTypeMatches":
+            haystack = str(facts.get("commodityType") or "").lower()
+            needles = vv if isinstance(vv, list) else [vv]
+            if not any(str(n).lower() in haystack for n in needles):
+                return False
+            continue
+
+        if kk == "isImported":
+            if bool(facts.get("isImported")) != vv:
+                return False
+            continue
+
+        if kk == "specialCase":
+            predicate = _SPECIAL_CASES.get(str(vv))
+            if predicate is None or not predicate(facts):
+                return False
+            continue
+
+        fact_val = facts.get(kk)
+        if isinstance(vv, list):
+            if fact_val not in vv:
+                return False
+        else:
+            if fact_val != vv:
+                return False
+    return True
+
+
 def _rule_exempt(rule: dict, facts: dict, ruleset: dict) -> Optional[dict]:
     exempt = rule.get("exemptWhen")
     if not exempt:
@@ -175,66 +413,80 @@ def _rule_exempt(rule: dict, facts: dict, ruleset: dict) -> Optional[dict]:
 
     applicabilities = {a["id"]: a for a in ruleset.get("applicability", [])}
 
+    def _mk(reason: str, app_id: Optional[str] = None) -> dict:
+        d = {
+            "ruleId": rule.get("id"),
+            "ruleReference": rule.get("ruleReference"),
+            "title": rule.get("title"),
+            "status": EXEMPT,
+            "reason": reason,
+        }
+        if app_id:
+            d["applicabilityId"] = app_id
+        return d
+
     if isinstance(exempt, dict) and "applicabilityId" in exempt:
         app = applicabilities.get(exempt["applicabilityId"])
         if app and _evaluate_applicability(app, facts):
-            return {
-                "ruleId": rule.get("id"),
-                "ruleReference": rule.get("ruleReference"),
-                "title": rule.get("title"),
-                "status": EXEMPT,
-                "reason": (
-                    f"Exempt under {app.get('ruleReference')}: "
-                    f"{app.get('description', '').strip().splitlines()[0]}"
-                ),
-                "applicabilityId": app.get("id"),
-            }
+            return _mk(
+                f"Exempt under {app.get('ruleReference')}: "
+                f"{(app.get('description') or '').strip().splitlines()[0] if app.get('description') else ''}",
+                app.get("id"),
+            )
         return None
 
     if isinstance(exempt, dict) and "anyOf" in exempt:
         for child in exempt["anyOf"]:
-            if isinstance(child, dict):
-                if "applicabilityId" in child:
-                    app = applicabilities.get(child["applicabilityId"])
-                    if app and _evaluate_applicability(app, facts):
-                        return {
-                            "ruleId": rule.get("id"),
-                            "ruleReference": rule.get("ruleReference"),
-                            "title": rule.get("title"),
-                            "status": EXEMPT,
-                            "reason": f"Exempt under {app.get('ruleReference')}",
-                            "applicabilityId": app.get("id"),
-                        }
-                else:
-                    if all(
-                        facts.get(kk) == vv or vv == "any"
-                        for kk, vv in child.items()
-                    ):
-                        return {
-                            "ruleId": rule.get("id"),
-                            "status": EXEMPT,
-                            "reason": f"Exempt per condition {child}",
-                        }
+            if not isinstance(child, dict):
+                continue
+            if "applicabilityId" in child:
+                app = applicabilities.get(child["applicabilityId"])
+                if app and _evaluate_applicability(app, facts):
+                    return _mk(f"Exempt under {app.get('ruleReference')}",
+                               app.get("id"))
+                continue
+            if _evaluate_exempt_condition(child, facts):
+                parts = [f"{kk}={vv}" for kk, vv in child.items()]
+                return _mk(f"Exempt per condition: {', '.join(parts)}")
         return None
 
     return None
 
 
+# ============================================================
+# APPLICABILITY LOGIC
+# ============================================================
 def _evaluate_applicability(app: dict, facts: dict) -> bool:
     logic = app.get("logic") or {}
 
     def _check(node: dict) -> bool:
         for key, spec in node.items():
             if key == "anyOf":
-                return any(_check(child) for child in spec)
+                if not isinstance(spec, list):
+                    return False
+                if not any(_check(child) for child in spec if isinstance(child, dict)):
+                    return False
+                continue
             if key == "allOf":
-                return all(_check(child) for child in spec)
+                if not isinstance(spec, list):
+                    return False
+                if not all(_check(child) for child in spec if isinstance(child, dict)):
+                    return False
+                continue
+            if key == "not":
+                if _check(spec):
+                    return False
+                continue
             if key == "quantityExceeds":
                 q = _quantity_in(facts, spec["unit"])
-                return q is not None and q > spec["value"]
+                if q is None or q <= spec["value"]:
+                    return False
+                continue
             if key == "quantityAtMost":
                 q = _quantity_in(facts, spec["unit"])
-                return q is not None and q <= spec["value"]
+                if q is None or q > spec["value"]:
+                    return False
+                continue
             if key == "saleType":
                 actual = facts.get("saleType")
                 if actual is None:
@@ -244,6 +496,7 @@ def _evaluate_applicability(app: dict, facts: dict) -> bool:
                         return False
                 elif actual != spec:
                     return False
+                continue
             if key == "productCategory":
                 actual = facts.get("productCategory")
                 if actual is None:
@@ -253,13 +506,19 @@ def _evaluate_applicability(app: dict, facts: dict) -> bool:
                         return False
                 elif actual != spec:
                     return False
+                continue
             if key == "commodityTypeMatches":
-                commodity = str(facts.get("productSubcategory") or "").lower()
-                if not any(k.lower() in commodity for k in spec):
+                haystack = str(facts.get("commodityType") or "").lower()
+                needles = spec if isinstance(spec, list) else [spec]
+                if not any(str(n).lower() in haystack for n in needles):
                     return False
+                continue
             if key == "coveredByDpco":
                 if bool(facts.get("coveredByDpco")) != spec:
                     return False
+                continue
+            logger.debug("applicability: unknown logic key %r", key)
+            return False
         return True
 
     return _check(logic)
@@ -267,7 +526,7 @@ def _evaluate_applicability(app: dict, facts: dict) -> bool:
 
 def _quantity_in(facts: dict, unit: str) -> Optional[float]:
     value = _number(facts.get("netQuantityValue"))
-    raw_unit = str(facts.get("netQuantityUnit") or "").lower()
+    raw_unit = _normalise_unit(facts.get("netQuantityUnit"))
     if value is None or not raw_unit:
         return None
 
@@ -288,6 +547,7 @@ def _quantity_in(facts: dict, unit: str) -> Optional[float]:
         return None
 
     base_unit, base_value = normalised
+    unit_norm = _normalise_unit(unit)
     req_map = {
         "g": "g", "kg": "g", "mg": "g",
         "ml": "ml", "l": "ml",
@@ -295,13 +555,13 @@ def _quantity_in(facts: dict, unit: str) -> Optional[float]:
         "m2": "m2", "dm2": "m2", "cm2": "m2",
         "g_or_ml": base_unit,
     }
-    req_base = req_map.get(unit, unit)
-    if req_base != base_unit and unit != "g_or_ml":
+    req_base = req_map.get(unit_norm, unit_norm)
+    if req_base != base_unit and unit_norm != "g_or_ml":
         return None
 
-    if unit == "kg" and base_unit == "g":
+    if unit_norm == "kg" and base_unit == "g":
         return base_value / 1000.0
-    if unit == "l" and base_unit == "ml":
+    if unit_norm == "l" and base_unit == "ml":
         return base_value / 1000.0
     return base_value
 
@@ -320,34 +580,40 @@ def validator(name: str):
     return deco
 
 
-@validator("presence")
-def _v_presence(v: dict, facts: dict) -> tuple[str, str]:
-    specs = v.get("fields") or ([v["field"]] if "field" in v else [])
-    missing = []
-    for spec in specs:
-        if not _is_present(_first_present(facts, spec)):
-            missing.append(spec)
-    if missing:
-        action = v.get("failAction", FAIL)
-        return action, f"Missing required field(s): {', '.join(missing)}"
-    return PASS, "All required fields present."
+class _SkipRule(Exception):
+    """Raised by a validator that wants the whole rule to be skipped."""
 
 
-@validator("presenceAny")
-def _v_presence_any(v: dict, facts: dict) -> tuple[str, str]:
-    specs = v.get("fields") or []
-    if any(_is_present(_first_present(facts, spec)) for spec in specs):
-        return PASS, "At least one required field present."
-    return v.get("failAction", FAIL), f"None of: {', '.join(specs)}"
+# ---- P0-A: missing-evidence-safe numeric validators ----------------
+
+def _missing_evidence_status(v: dict) -> str:
+    """
+    Status to return when a validator cannot find its field.
+
+    Rules can override with `onMissing:` (recommended) or set
+    `failAction: FAIL` explicitly if a missing value really is a
+    hard failure (e.g. Rule 6(1)(e) MRP).
+    """
+    if "onMissing" in v:
+        return v["onMissing"]
+    # Explicit FAIL in failAction means the rule author *does* want a
+    # hard failure when the value is missing. Respect that.
+    if v.get("failAction") == FAIL:
+        return FAIL
+    return UNCERTAIN
 
 
 @validator("numericPositive")
 def _v_numeric_positive(v: dict, facts: dict) -> tuple[str, str]:
     val = _number(_first_present(facts, v["field"]))
     if val is None:
-        return FAIL, f"Field '{v['field']}' missing or non-numeric."
+        return _missing_evidence_status(v), (
+            f"Missing or non-numeric '{v['field']}'."
+        )
     if val <= 0:
-        return FAIL, f"Field '{v['field']}' is not a positive number ({val})."
+        return v.get("failAction", FAIL), (
+            f"Field '{v['field']}' is not a positive number ({val})."
+        )
     return PASS, "Positive numeric value present."
 
 
@@ -355,7 +621,9 @@ def _v_numeric_positive(v: dict, facts: dict) -> tuple[str, str]:
 def _v_numeric_min(v: dict, facts: dict) -> tuple[str, str]:
     val = _number(_first_present(facts, v["field"]))
     if val is None:
-        return v.get("failAction", FAIL), f"Missing or non-numeric '{v['field']}'."
+        return _missing_evidence_status(v), (
+            f"Missing or non-numeric '{v['field']}'."
+        )
     if val < v["minValue"]:
         return v.get("failAction", FAIL), (
             f"'{v['field']}' = {val} < required min {v['minValue']}."
@@ -368,6 +636,8 @@ def _v_numeric_compare(v: dict, facts: dict) -> tuple[str, str]:
     lhs = _number(_first_present(facts, v["lhsField"]))
     rhs = _number(_first_present(facts, v["rhsField"]))
     if lhs is None or rhs is None:
+        # This is a comparison, not a presence check — one side missing
+        # is *always* insufficient evidence to make a determination.
         return UNCERTAIN, "One or both operands missing."
     rel = v.get("relation", "<=")
     ok = {
@@ -392,6 +662,71 @@ def _v_numeric_ratio_equal(v: dict, facts: dict) -> tuple[str, str]:
         )
     return PASS, "Ratio within tolerance."
 
+
+# ---- presence ------------------------------------------------------
+
+@validator("presence")
+def _v_presence(v: dict, facts: dict) -> tuple[str, str]:
+    specs = v.get("fields") or ([v["field"]] if "field" in v else [])
+    missing_specs, missing_facts = [], []
+    for spec in specs:
+        if not _is_present(_first_present(facts, spec)):
+            missing_specs.append(spec)
+            missing_facts.extend(f.strip() for f in spec.split("|"))
+    if missing_specs:
+        action = v.get("failAction", FAIL)
+        return action, f"Missing required field(s): {', '.join(missing_facts)}"
+    return PASS, "All required fields present."
+
+
+@validator("presenceAny")
+def _v_presence_any(v: dict, facts: dict) -> tuple[str, str]:
+    specs = v.get("fields") or []
+    if any(_is_present(_first_present(facts, spec)) for spec in specs):
+        return PASS, "At least one required field present."
+    return v.get("failAction", FAIL), f"None of: {', '.join(specs)}"
+
+
+@validator("presenceIfCondition")
+def _v_presence_if(v: dict, facts: dict) -> tuple[str, str]:
+    if not facts.get(v.get("condition")):
+        return PASS, "Condition not met."
+    if not _is_present(_first_present(facts, v["field"])):
+        return v.get("failAction", FAIL), f"'{v['field']}' required by condition."
+    return PASS, "Conditional field present."
+
+
+@validator("presenceOnPdp")
+def _v_presence_on_pdp(v: dict, facts: dict) -> tuple[str, str]:
+    specs = v.get("fields") or []
+    if not specs:
+        parent_req = v.get("_parentRequires") or {}
+        if isinstance(parent_req, dict):
+            if "field" in parent_req:
+                specs = [parent_req["field"]]
+            elif "fields" in parent_req:
+                specs = list(parent_req["fields"])
+            elif "anyOf" in parent_req:
+                for child in parent_req["anyOf"]:
+                    if isinstance(child, dict) and "field" in child:
+                        specs.append(child["field"])
+                    elif isinstance(child, dict) and "allOf" in child:
+                        for sub in child["allOf"]:
+                            if isinstance(sub, dict) and "field" in sub:
+                                specs.append(sub["field"])
+    if not specs:
+        return UNCERTAIN, "presenceOnPdp: no fields to check."
+
+    on_pdp = bool(facts.get("declarationOnPdp"))
+    if not on_pdp:
+        return v.get("failAction", UNCERTAIN), "Declaration not confirmed on PDP."
+    for spec in specs:
+        if not _is_present(_first_present(facts, spec)):
+            return v.get("failAction", UNCERTAIN), f"'{spec}' missing."
+    return PASS, "Declarations present on PDP."
+
+
+# ---- dates ---------------------------------------------------------
 
 @validator("dateIso")
 def _v_date_iso(v: dict, facts: dict) -> tuple[str, str]:
@@ -418,10 +753,11 @@ def _v_date_compare(v: dict, facts: dict) -> tuple[str, str]:
             rhs_spec = parent_fields[1]
 
     lhs = _date(_first_present(facts, lhs_spec)) if lhs_spec else None
-    rhs = _date(_first_present(facts, rhs_spec)) if rhs_spec else None
 
-    if rhs_spec == "inspectionDate" or (rhs is None and rhs_spec == "inspectionDate"):
+    if rhs_spec == "inspectionDate":
         rhs = _date(facts.get("inspectionDate")) or date.today()
+    else:
+        rhs = _date(_first_present(facts, rhs_spec)) if rhs_spec else None
 
     if lhs is None or rhs is None:
         return UNCERTAIN, "Date comparison operands missing."
@@ -465,7 +801,14 @@ def _v_date_delta_max(v: dict, facts: dict) -> tuple[str, str]:
     if val is None:
         return UNCERTAIN, "No date present to evaluate age."
 
-    ref = _date(facts.get("inspectionDate")) or date.today()
+    reference = v.get("reference", "inspectionDate")
+    if reference == "inspectionDate":
+        ref = _date(facts.get("inspectionDate")) or date.today()
+    else:
+        ref = _date(_first_present(facts, reference))
+        if ref is None:
+            return UNCERTAIN, f"Reference date '{reference}' missing."
+
     max_years = float(v.get("maxYears", 5))
     delta_days = (ref - val).days
     if delta_days > max_years * 365.25:
@@ -475,13 +818,19 @@ def _v_date_delta_max(v: dict, facts: dict) -> tuple[str, str]:
     return PASS, "Age within tolerance."
 
 
+# ---- text / regex --------------------------------------------------
+
 @validator("regex")
 def _v_regex(v: dict, facts: dict) -> tuple[str, str]:
     val = _first_present(facts, v["field"])
     if not _is_present(val):
         return PASS, "Field absent; regex not applied."
     flags = re.IGNORECASE if v.get("caseInsensitive") else 0
-    if not re.search(v["pattern"], str(val), flags):
+    try:
+        matched = re.search(v["pattern"], str(val), flags) is not None
+    except re.error as exc:
+        return UNCERTAIN, f"Invalid regex in rule: {exc}"
+    if not matched:
         if v.get("missingPatternAction"):
             return v["missingPatternAction"], (
                 f"'{v['field']}' does not match pattern {v['pattern']}."
@@ -498,10 +847,14 @@ def _v_forbidden_substring(v: dict, facts: dict) -> tuple[str, str]:
     if not _is_present(val):
         return PASS, "Field absent; nothing to check."
     text = str(val)
-    haystack = text.lower() if v.get("caseInsensitive", True) else text
+    ci = v.get("caseInsensitive", True)
+    word_boundary = v.get("wordBoundary", True)
     for word in v.get("forbidden", []):
-        needle = word.lower() if v.get("caseInsensitive", True) else word
-        if needle in haystack:
+        if word_boundary:
+            hit = _word_in(word, text, ci)
+        else:
+            hit = (word.lower() in text.lower()) if ci else (word in text)
+        if hit:
             return v.get("failAction", FAIL), f"Forbidden term '{word}' present."
     return PASS, "No forbidden terms."
 
@@ -513,33 +866,38 @@ def _v_required_substring(v: dict, facts: dict) -> tuple[str, str]:
         return v.get("failAction", UNCERTAIN), (
             f"'{v['field']}' absent; cannot confirm required phrase."
         )
-    text = str(val).lower()
-    if v["required"].lower() not in text:
+    text = str(val)
+    word_boundary = v.get("wordBoundary", True)
+    required = v["required"]
+    if word_boundary:
+        hit = _word_in(required, text, case_insensitive=True)
+    else:
+        hit = required.lower() in text.lower()
+    if not hit:
         return v.get("failAction", UNCERTAIN), (
-            f"Required phrase '{v['required']}' not found."
+            f"Required phrase '{required}' not found."
         )
     return PASS, "Required phrase present."
 
+
+# ---- units ---------------------------------------------------------
 
 @validator("unitMembership")
 def _v_unit_membership(v: dict, facts: dict) -> tuple[str, str]:
     unit = _first_present(facts, v["field"])
     if not _is_present(unit):
         return PASS, "Unit absent."
-    unit = str(unit).strip().lower()
+    unit = _normalise_unit(unit)
 
     allowed = set()
-    if "allowedSymbols" in v:
-        for group in v["allowedSymbols"].values():
-            allowed.update(s.lower() for s in group)
-    elif "allowedUnits" in v:
-        for group in v["allowedUnits"].values():
-            allowed.update(s.lower() for s in group)
+    src = v.get("allowedSymbols") or v.get("allowedUnits") or {}
+    for group in src.values():
+        allowed.update(_normalise_unit(s) for s in group)
 
     if allowed and unit not in allowed:
         return v.get("failAction", FAIL), f"Unit '{unit}' not in recognised list."
 
-    rejected = {s.lower() for s in (v.get("rejectSymbols") or [])}
+    rejected = {_normalise_unit(s) for s in (v.get("rejectSymbols") or [])}
     if unit in rejected:
         return v.get("failAction", FAIL), f"Unit '{unit}' is not an SI unit."
 
@@ -549,10 +907,10 @@ def _v_unit_membership(v: dict, facts: dict) -> tuple[str, str]:
 @validator("unitFamilyConsistency")
 def _v_unit_family(v: dict, facts: dict) -> tuple[str, str]:
     state = str(_first_present(facts, v["stateField"]) or "").lower()
-    unit = str(_first_present(facts, v["unitField"]) or "").lower()
+    unit = _normalise_unit(_first_present(facts, v["unitField"]))
     if not state or not unit:
         return UNCERTAIN, "Unit family cannot be verified (state or unit missing)."
-    allowed = [s.lower() for s in (v.get("mapping") or {}).get(state, [])]
+    allowed = [_normalise_unit(s) for s in (v.get("mapping") or {}).get(state, [])]
     if allowed and unit not in allowed:
         return v.get("failAction", FAIL), (
             f"Unit '{unit}' not compatible with physical state '{state}'."
@@ -563,7 +921,7 @@ def _v_unit_family(v: dict, facts: dict) -> tuple[str, str]:
 @validator("unitMagnitudeMatch")
 def _v_unit_magnitude(v: dict, facts: dict) -> tuple[str, str]:
     value = _number(facts.get("netQuantityValue"))
-    unit = str(facts.get("netQuantityUnit") or "").lower()
+    unit = _normalise_unit(facts.get("netQuantityUnit"))
     if value is None or not unit:
         return UNCERTAIN, "Cannot verify unit magnitude (quantity or unit missing)."
     for rule in v.get("rules", []):
@@ -572,9 +930,9 @@ def _v_unit_magnitude(v: dict, facts: dict) -> tuple[str, str]:
         converted = _quantity_in(facts, threshold_unit)
         if converted is None:
             continue
-        expected_unit = (
+        expected_unit = _normalise_unit(
             rule["below"] if converted < threshold_value else rule["atOrAbove"]
-        ).lower()
+        )
         if unit != expected_unit:
             return v.get("failAction", UNCERTAIN), (
                 f"Quantity {value}{unit} should be expressed as {expected_unit}."
@@ -588,7 +946,7 @@ def _v_threshold_lookup(v: dict, facts: dict) -> tuple[str, str]:
     if measured is None:
         return UNCERTAIN, "Numeral height not measured."
 
-    method = facts.get("packageSurfaceMethod") or "normal"
+    method = str(facts.get("packageSurfaceMethod") or "normal").lower()
     mode_key = (
         "blownOrMolded"
         if method in ("blown", "formed", "molded", "embossed", "perforated")
@@ -597,42 +955,46 @@ def _v_threshold_lookup(v: dict, facts: dict) -> tuple[str, str]:
 
     lookup_by = v.get("lookupBy", "netQuantityValue")
     spec = lookup_by.split("|")[0]
+
+    quantity_bands = {"whenQuantityAtMost", "whenQuantityBetween", "whenQuantityAbove"}
+    pdp_bands = {"whenPdpAreaAtMostCm2", "whenPdpAreaBetweenCm2", "whenPdpAreaAboveCm2"}
+
+    if spec == "pdpAreaCm2":
+        allowed_band_keys = pdp_bands
+    else:
+        allowed_band_keys = quantity_bands
+
     key_value = _number(_first_present(facts, spec))
+    pdp_area = _number(facts.get("pdpAreaCm2"))
 
     for band in v.get("table", []):
+        present_keys = set(band.keys()) & (quantity_bands | pdp_bands)
+        if not present_keys & allowed_band_keys:
+            continue
+
         if "whenQuantityAtMost" in band:
-            limit = band["whenQuantityAtMost"]
-            if key_value is not None and key_value <= limit["value"]:
-                required = band["minHeightMm"][mode_key]
-                return _compare_height(measured, required, v)
+            if key_value is not None and key_value <= band["whenQuantityAtMost"]["value"]:
+                return _compare_height(measured, band["minHeightMm"][mode_key], v)
         elif "whenQuantityBetween" in band:
             low = band["whenQuantityBetween"]["low"]["value"]
             high = band["whenQuantityBetween"]["high"]["value"]
             if key_value is not None and low < key_value <= high:
-                required = band["minHeightMm"][mode_key]
-                return _compare_height(measured, required, v)
+                return _compare_height(measured, band["minHeightMm"][mode_key], v)
         elif "whenQuantityAbove" in band:
             low = band["whenQuantityAbove"]["value"]
             if key_value is not None and key_value > low:
-                required = band["minHeightMm"][mode_key]
-                return _compare_height(measured, required, v)
+                return _compare_height(measured, band["minHeightMm"][mode_key], v)
         elif "whenPdpAreaAtMostCm2" in band:
-            area = _number(facts.get("pdpAreaCm2"))
-            if area is not None and area <= band["whenPdpAreaAtMostCm2"]:
-                required = band["minHeightMm"][mode_key]
-                return _compare_height(measured, required, v)
+            if pdp_area is not None and pdp_area <= band["whenPdpAreaAtMostCm2"]:
+                return _compare_height(measured, band["minHeightMm"][mode_key], v)
         elif "whenPdpAreaBetweenCm2" in band:
             low = band["whenPdpAreaBetweenCm2"]["low"]
             high = band["whenPdpAreaBetweenCm2"]["high"]
-            area = _number(facts.get("pdpAreaCm2"))
-            if area is not None and low < area <= high:
-                required = band["minHeightMm"][mode_key]
-                return _compare_height(measured, required, v)
+            if pdp_area is not None and low < pdp_area <= high:
+                return _compare_height(measured, band["minHeightMm"][mode_key], v)
         elif "whenPdpAreaAboveCm2" in band:
-            area = _number(facts.get("pdpAreaCm2"))
-            if area is not None and area > band["whenPdpAreaAboveCm2"]:
-                required = band["minHeightMm"][mode_key]
-                return _compare_height(measured, required, v)
+            if pdp_area is not None and pdp_area > band["whenPdpAreaAboveCm2"]:
+                return _compare_height(measured, band["minHeightMm"][mode_key], v)
 
     return UNCERTAIN, "No threshold band matched."
 
@@ -654,6 +1016,8 @@ def _is_calibrated(v: dict) -> bool:
     return bool(v.get("calibrated", False))
 
 
+# ---- structural ----------------------------------------------------
+
 @validator("compositeAddress")
 def _v_composite_address(v: dict, facts: dict) -> tuple[str, str]:
     specs = v.get("fields") or [
@@ -668,9 +1032,20 @@ def _v_composite_address(v: dict, facts: dict) -> tuple[str, str]:
         return PASS, "Address field absent; nothing to validate."
     text = str(address)
     has_street_like = bool(re.search(r"\d", text)) or bool(
-        re.search(r"road|street|marg|lane|plot|sector|nagar", text, re.I)
+        re.search(r"\b(road|street|marg|lane|plot|sector|nagar|avenue|"
+                  r"block|phase|gali|chowk|colony|layout|industrial\s+area)\b",
+                  text, re.I)
     )
-    has_city_or_state = bool(re.search(r"[A-Z][a-z]+", text))
+    has_city_or_state = bool(
+        re.search(r"\b(india|bharat|pradesh|nagar|pur|abad|garh|"
+                  r"maharashtra|gujarat|karnataka|tamil\s+nadu|"
+                  r"uttar\s+pradesh|madhya\s+pradesh|west\s+bengal|"
+                  r"rajasthan|punjab|haryana|kerala|telangana|"
+                  r"andhra|odisha|bihar|jharkhand|assam|goa)\b",
+                  text, re.I)
+        or re.search(r"\b\d{6}\b", text)
+        or re.search(r"\b[A-Z]{2}\b", text)
+    )
     if not (has_street_like and has_city_or_state):
         return v.get("onMissingCritical", UNCERTAIN), (
             "Address appears incomplete (missing street or city/state)."
@@ -696,10 +1071,11 @@ def _v_region_overlap(v: dict, facts: dict) -> tuple[str, str]:
     overlapping_fields = v.get("overlappingField", "").split("|")
     for suspect in suspects:
         for f in overlapping_fields:
+            f = f.strip()
             target = facts.get(f"{f}RegionBbox") or facts.get(f)
             if target and _bboxes_overlap(suspect.get("bbox"), target):
                 return v.get("failAction", UNCERTAIN), (
-                    f"Sticker overlaps required declaration '{f.strip()}'."
+                    f"Sticker overlaps required declaration '{f}'."
                 )
     return PASS, "No problematic overlaps."
 
@@ -730,56 +1106,12 @@ def _v_boolean(v: dict, facts: dict) -> tuple[str, str]:
     val = facts.get(v["field"])
     if val is None:
         return UNCERTAIN, "Boolean field absent."
+    if v.get("ifTrue") == "skipRule" and bool(val):
+        raise _SkipRule()
     return PASS, "Boolean accepted."
 
 
-@validator("presenceIfCondition")
-def _v_presence_if(v: dict, facts: dict) -> tuple[str, str]:
-    if not facts.get(v.get("condition")):
-        return PASS, "Condition not met."
-    if not _is_present(_first_present(facts, v["field"])):
-        return v.get("failAction", FAIL), f"'{v['field']}' required by condition."
-    return PASS, "Conditional field present."
-
-
-@validator("presenceOnPdp")
-def _v_presence_on_pdp(v: dict, facts: dict) -> tuple[str, str]:
-    specs = v.get("fields") or []
-    on_pdp = bool(facts.get("declarationOnPdp"))
-    if not on_pdp:
-        return v.get("failAction", UNCERTAIN), "Declaration not confirmed on PDP."
-    for spec in specs:
-        if not _is_present(_first_present(facts, spec)):
-            return v.get("failAction", UNCERTAIN), f"'{spec}' missing."
-    return PASS, "Declarations present on PDP."
-
-
-@validator("colourContrast")
-def _v_colour_contrast(v: dict, facts: dict) -> tuple[str, str]:
-    ratio = _number(facts.get("contrastRatio"))
-    if ratio is None:
-        return UNCERTAIN, "Contrast ratio not measured."
-    if ratio < float(v.get("minContrastRatio", 3.0)):
-        return v.get("failAction", UNCERTAIN), (
-            f"Contrast ratio {ratio} below minimum {v['minContrastRatio']}."
-        )
-    return PASS, "Contrast sufficient."
-
-
-@validator("clearanceCheck")
-def _v_clearance_check(v: dict, facts: dict) -> tuple[str, str]:
-    return PASS, "Quantity clearance accepted."
-
-
-@validator("manualReview")
-def _v_manual_review(v: dict, facts: dict) -> tuple[str, str]:
-    return UNCERTAIN, "Requires manual review."
-
-
-@validator("premisesEquipmentCheck")
-def _v_premises_equipment(v: dict, facts: dict) -> tuple[str, str]:
-    return UNCERTAIN, "Premises-equipment check requires inspector confirmation."
-
+# ---- misc / placeholders ------------------------------------------
 
 @validator("notEqual")
 def _v_not_equal(v: dict, facts: dict) -> tuple[str, str]:
@@ -796,14 +1128,51 @@ def _v_not_equal(v: dict, facts: dict) -> tuple[str, str]:
 @validator("atLeastOneOf")
 def _v_at_least_one_of(v: dict, facts: dict) -> tuple[str, str]:
     channels = v.get("channels", [])
+    field_map = {
+        "phone": ["customerCarePhone"],
+        "email": ["customerCareEmail"],
+        "address": ["customerCareAddress"],
+        "care": ["customerCare"],
+    }
     for ch in channels:
-        for f in (
-            "customerCarePhone", "customerCareEmail",
-            "customerCareAddress", "customerCare",
-        ):
-            if ch in f.lower() and _is_present(facts.get(f)):
+        for f in field_map.get(ch.lower(), []):
+            if _is_present(facts.get(f)):
                 return PASS, f"Channel '{ch}' present."
     return v.get("failAction", UNCERTAIN), f"No channel among {channels}."
+
+
+@validator("colourContrast")
+def _v_colour_contrast(v: dict, facts: dict) -> tuple[str, str]:
+    ratio = _number(facts.get("contrastRatio"))
+    if ratio is None:
+        return UNCERTAIN, "Contrast ratio not measured."
+    if ratio < float(v.get("minContrastRatio", 3.0)):
+        return v.get("failAction", UNCERTAIN), (
+            f"Contrast ratio {ratio} below minimum {v['minContrastRatio']}."
+        )
+    return PASS, "Contrast sufficient."
+
+
+# ---- P1-A: manualReview honours failAction -------------------------
+
+@validator("manualReview")
+def _v_manual_review(v: dict, facts: dict) -> tuple[str, str]:
+    action = v.get("failAction", UNCERTAIN)
+    if action == PASS:
+        return PASS, "Manual review noted (informational)."
+    return action, "Requires manual review."
+
+
+@validator("premisesEquipmentCheck")
+def _v_premises_equipment(v: dict, facts: dict) -> tuple[str, str]:
+    return v.get("failAction", UNCERTAIN), (
+        "Premises-equipment check requires inspector confirmation."
+    )
+
+
+@validator("clearanceCheck")
+def _v_clearance_check(v: dict, facts: dict) -> tuple[str, str]:
+    return PASS, "Quantity clearance accepted."
 
 
 @validator("numericDomain")
@@ -823,7 +1192,9 @@ def _v_derived_check(v: dict, facts: dict) -> tuple[str, str]:
 
 @validator("documentedExclusion")
 def _v_documented_exclusion(v: dict, facts: dict) -> tuple[str, str]:
-    return UNCERTAIN, "Wrapper exclusion must be confirmed by inspector."
+    return v.get("failAction", UNCERTAIN), (
+        "Wrapper exclusion must be confirmed by inspector."
+    )
 
 
 @validator("compositeDimension")
@@ -848,6 +1219,7 @@ def _v_region_alteration(v: dict, facts: dict) -> tuple[str, str]:
 def _evaluate_validations(rule: dict, facts: dict) -> tuple[str, str]:
     validations = rule.get("validations") or []
     parent_fields = rule.get("fields") or []
+    parent_requires = rule.get("requires") or {}
     worst_status = PASS
     reasons: list[str] = []
 
@@ -855,6 +1227,8 @@ def _evaluate_validations(rule: dict, facts: dict) -> tuple[str, str]:
         v = dict(raw_v)
         if parent_fields and "_parentFields" not in v:
             v["_parentFields"] = parent_fields
+        if parent_requires and "_parentRequires" not in v:
+            v["_parentRequires"] = parent_requires
 
         vtype = v.get("type")
         if not vtype:
@@ -876,6 +1250,8 @@ def _evaluate_validations(rule: dict, facts: dict) -> tuple[str, str]:
 
         try:
             st, reason = fn(v, facts)
+        except _SkipRule:
+            return NOT_APPLICABLE, "Rule skipped by validator directive."
         except Exception as exc:
             st, reason = UNCERTAIN, f"validator error: {exc}"
 
@@ -916,26 +1292,59 @@ def _evaluate_cross_field(ruleset: dict, facts: dict) -> list[dict]:
 
 
 # ============================================================
-# VERIFICATION
+# VERIFICATION  (P1-C: gst/gstin aliasing)
 # ============================================================
+_VERIFICATION_KEY_ALIASES = {
+    "gst": "gstin",
+    "gstin": "gstin",
+    "fssai": "fssai",
+    "bis": "bis",
+}
+
+
+def _lookup_verification(verification: dict, authority: str) -> Optional[dict]:
+    key = _VERIFICATION_KEY_ALIASES.get(authority.lower(), authority.lower())
+    if key in verification:
+        return verification[key]
+    for k, v in verification.items():
+        if _VERIFICATION_KEY_ALIASES.get(k.lower(), k.lower()) == key:
+            return v
+    return None
+
+
 def _evaluate_verification(ruleset: dict, facts: dict,
                            verification: Optional[dict]) -> list[dict]:
     out: list[dict] = []
     if not verification:
         return out
     for adapter in ruleset.get("verification", []) or []:
-        auth = adapter.get("authority", "").lower()
-        vr = verification.get(auth)
+        auth = adapter.get("authority", "")
+        vr = _lookup_verification(verification, auth)
         if not vr:
             continue
         v_status = vr.get("status", "UNKNOWN")
         if v_status == "VALID":
             continue
+
+        on_mismatch = adapter.get("onMismatch", "UNCERTAIN")
+        on_unavailable = adapter.get("onUnavailable", "UNCERTAIN")
+
+        if v_status == "API_UNAVAILABLE":
+            mapped = on_unavailable
+        elif v_status in ("INVALID", "MALFORMED"):
+            mapped = on_mismatch
+        else:
+            mapped = "UNCERTAIN"
+
+        mapped = str(mapped).upper()
+        if mapped not in _ALL_STATUSES:
+            mapped = UNCERTAIN
+
         out.append({
             "ruleId": adapter.get("id"),
-            "title": adapter.get("authority"),
+            "title": auth,
             "legalReference": "External authority verification",
-            "status": UNCERTAIN,
+            "status": mapped,
             "reason": f"{v_status}: {vr.get('detail', '')}",
         })
     return out
@@ -963,6 +1372,9 @@ def evaluate(
     for key, default in _CONTEXT_DEFAULTS.items():
         if facts.get(key) is None:
             facts[key] = default
+
+    # P0-B: derive facts the engine needs from facts the extractor emits.
+    facts = _derive_facts(facts)
 
     findings: list[dict] = []
     counts = {s: 0 for s in _ALL_STATUSES}
@@ -1037,7 +1449,12 @@ def evaluate(
         vf["reviewPolicy"] = "onUncertain"
         _add(vf)
 
-    applicable = [f for f in findings if f["status"] != NOT_APPLICABLE]
+    # P1-B: informational findings do not affect overallStatus.
+    applicable = [
+        f for f in findings
+        if f["status"] != NOT_APPLICABLE
+        and f.get("severity") != "informational"
+    ]
     if not applicable:
         overall = EXEMPT if any(f["status"] == EXEMPT for f in findings) else NOT_APPLICABLE
     elif any(f["status"] == FAIL for f in applicable):

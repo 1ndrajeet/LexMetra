@@ -12,7 +12,7 @@ export default async function Home() {
   });
 
   if (!session) {
-    redirect("/auth");
+    redirect("/login");
   }
 
   return <>

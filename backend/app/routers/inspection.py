@@ -1,9 +1,16 @@
 # backend/app/routers/inspection.py
 """
 LexMetra inspection router — single file pipeline.
-PaddleOCR -> Gemini 2.5 Flash -> structured facts -> rule engine.
-camelCase end to end for the DB layer; the rule engine returns snake_case
-keys, which is why the two reads near the bottom use snake_case.
+PaddleOCR -> Gemini 2.5 Flash -> structured facts -> rule engine -> DB.
+
+Persists every artifact the pipeline produces:
+  Declaration         — one row per OCR text line
+  ExtractedProduct    — the canonical structured facts
+  ExtractedField      — per-field audit trail
+  RuleEvaluation      — one row per inspection (engine top-level output)
+  RuleResult          — one row per rule finding
+  VerificationResult  — one row per authority (FSSAI / GST / BIS)
+  Inspection.preClassification — Gemini's client-side classification
 """
 import os
 os.environ["FLAGS_use_mkldnn"] = "0"
@@ -17,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, List
 
-from fastapi import APIRouter, HTTPException, Depends, Path, Query
+from fastapi import APIRouter, HTTPException, Depends, Path, Query, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from dotenv import load_dotenv
@@ -26,6 +33,7 @@ from app.lib.db import get_db
 from app.lib.models import (
     Inspection, Image, Declaration,
     ExtractedProduct, ExtractedField,
+    RuleEvaluation, RuleResult, VerificationResult,
 )
 from app.services.rules import evaluate as evaluate_rules
 from app.services.verification import verify_all
@@ -36,7 +44,7 @@ logger = logging.getLogger("lexmetra.inspection")
 load_dotenv()
 router = APIRouter()
 
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+GEMINI_MODELS = ["gemini-3.6-flash", "gemini-2.5-flash"]
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 
@@ -345,11 +353,85 @@ def _standardize(data: dict) -> dict:
 
 
 # ============================================================
+# PERSISTENCE HELPERS
+# ============================================================
+def _persist_rule_evaluation(db: Session, inspectionId: str, ruleResult: dict) -> int:
+    """
+    Wipe any prior rows for this inspection (idempotent re-runs), then
+    write one RuleEvaluation + one RuleResult per finding.
+    Returns number of findings written.
+    """
+    db.query(RuleEvaluation).filter(
+        RuleEvaluation.inspectionId == inspectionId
+    ).delete(synchronize_session=False)
+    db.query(RuleResult).filter(
+        RuleResult.inspectionId == inspectionId
+    ).delete(synchronize_session=False)
+
+    db.add(RuleEvaluation(
+        id=str(uuid.uuid4()),
+        inspectionId=inspectionId,
+        rulesetId=ruleResult.get("rulesetId"),
+        rulesetVersion=ruleResult.get("rulesetVersion"),
+        authority=ruleResult.get("authority"),
+        legalReference=ruleResult.get("legalReference"),
+        overallStatus=ruleResult.get("overallStatus", "UNCERTAIN"),
+        minConfidence=ruleResult.get("minConfidence"),
+        summary=ruleResult.get("summary"),
+        evaluatedAt=datetime.utcnow(),
+    ))
+
+    findings = ruleResult.get("findings") or []
+    for f in findings:
+        db.add(RuleResult(
+            id=str(uuid.uuid4()),
+            inspectionId=inspectionId,
+            declarationId=None,
+            rule=f.get("ruleId") or "UNKNOWN",
+            ruleReference=f.get("ruleReference"),
+            title=f.get("title"),
+            legalReference=f.get("legalReference"),
+            status=f.get("status", "UNCERTAIN"),
+            reason=f.get("reason"),
+            severity=f.get("severity"),
+            reviewPolicy=f.get("reviewPolicy"),
+            createdAt=datetime.utcnow(),
+        ))
+
+    return len(findings)
+
+
+def _persist_verifications(db: Session, inspectionId: str, verification: dict) -> int:
+    """Wipe + write one row per authority. Returns number of rows written."""
+    db.query(VerificationResult).filter(
+        VerificationResult.inspectionId == inspectionId
+    ).delete(synchronize_session=False)
+
+    n = 0
+    for authority, v in (verification or {}).items():
+        if not isinstance(v, dict):
+            continue
+        db.add(VerificationResult(
+            id=str(uuid.uuid4()),
+            inspectionId=inspectionId,
+            authority=str(v.get("source") or authority).upper(),
+            status=v.get("status", "UNVERIFIED"),
+            detail=v.get("detail"),
+            confidence=v.get("confidence"),
+            raw=v.get("raw"),
+            createdAt=datetime.utcnow(),
+        ))
+        n += 1
+    return n
+
+
+# ============================================================
 # ROUTES
 # ============================================================
 @router.post("/inspect/{inspectionId}")
 async def inspectImages(
     inspectionId: str = Path(...),
+    payload: dict = Body(default_factory=dict),
     db: Session = Depends(get_db),
 ):
     logger.info(f"{'='*60}")
@@ -370,11 +452,30 @@ async def inspectImages(
         if not images:
             raise HTTPException(400, "No images for this inspection")
 
+        # Persist client-side pre-classification + name override, if sent.
+        pre_cls = (payload or {}).get("preClassification")
+        if isinstance(pre_cls, dict) and pre_cls:
+            inspection.preClassification = pre_cls
+
+        override_name = (payload or {}).get("productName")
+        if isinstance(override_name, str) and override_name.strip():
+            inspection.productName = override_name.strip()[:200]
+
+        if pre_cls or override_name:
+            db.commit()
+            logger.info(
+                f"Stored client pre-classification "
+                f"(name={'yes' if override_name else 'no'}, "
+                f"cls={'yes' if pre_cls else 'no'})"
+            )
+
         existing = db.query(ExtractedProduct).filter(
             ExtractedProduct.inspectionId == inspectionId
         ).first()
         if existing:
-            logger.info(f"Already extracted → returning cached  status={existing.extractionStatus}")
+            logger.info(
+                f"Already extracted → returning cached  status={existing.extractionStatus}"
+            )
             return {
                 "success": True,
                 "inspectionId": inspectionId,
@@ -484,7 +585,7 @@ async def inspectImages(
                 vs = str(v)[:70] if v is not None else "null"
                 logger.info(f"    {k:24s} = {vs}")
 
-        # ---------- 3. Persist ----------
+        # ---------- 3. Persist structured facts ----------
         logger.info(f"{'-'*60}")
         logger.info(f"STEP 3 — Persist structured facts")
         logger.info(f"{'-'*60}")
@@ -612,6 +713,21 @@ async def inspectImages(
         inspection.verdict = ruleResult["overallStatus"]
         db.commit()
 
+        # ---------- 6. Persist rule evaluation, findings, verification ----------
+        logger.info(f"{'-'*60}")
+        logger.info(f"STEP 6 — Persist rule evaluation & verification")
+        logger.info(f"{'-'*60}")
+
+        with Timer(logger, "  Persist rule evaluation"):
+            n_findings = _persist_rule_evaluation(db, inspectionId, ruleResult)
+            n_verifs = _persist_verifications(db, inspectionId, verification)
+            db.commit()
+
+        logger.info(
+            f"Persisted 1 rule evaluation, {n_findings} findings, "
+            f"{n_verifs} verification results"
+        )
+
         return {
             "success": True,
             "inspectionId": inspectionId,
@@ -637,11 +753,17 @@ async def inspectImages(
         raise HTTPException(500, f"Inspection failed: {e}")
 
 
+# ============================================================
+# GET endpoints — return all persisted artifacts
+# ============================================================
 @router.get("/inspection/{inspectionId}")
 async def getInspection(
     inspectionId: str,
     includeDeclarations: bool = Query(False),
     includeExtracted: bool = Query(True),
+    includeRuleEvaluation: bool = Query(True),
+    includeFindings: bool = Query(True),
+    includeVerification: bool = Query(True),
     db: Session = Depends(get_db),
 ):
     inspection = db.query(Inspection).filter(Inspection.id == inspectionId).first()
@@ -661,17 +783,27 @@ async def getInspection(
         "verdict": inspection.verdict,
         "score": inspection.score,
         "status": inspection.status,
+        "saleType": inspection.saleType,
+        "productCategory": inspection.productCategory,
+        "preClassification": inspection.preClassification,
         "createdAt": inspection.createdAt,
         "completedAt": inspection.completedAt,
         "imageCount": len(images),
         "images": [
-            {"id": i.id, "url": i.url, "order": i.orderNum, "createdAt": i.createdAt}
+            {
+                "id": i.id,
+                "url": f"/api/v1/image/{i.id}",
+                "order": i.orderNum,
+                "createdAt": i.createdAt,
+            }
             for i in images
         ],
     }
 
     if includeDeclarations:
-        decls = db.query(Declaration).filter(Declaration.inspectionId == inspectionId).all()
+        decls = db.query(Declaration).filter(
+            Declaration.inspectionId == inspectionId
+        ).all()
         response["declarations"] = [
             {
                 "id": d.id, "field": d.field, "value": d.value,
@@ -740,6 +872,66 @@ async def getInspection(
                 },
             }
 
+    if includeRuleEvaluation:
+        re = db.query(RuleEvaluation).filter(
+            RuleEvaluation.inspectionId == inspectionId
+        ).first()
+        if re:
+            response["ruleEvaluation"] = {
+                "rulesetId": re.rulesetId,
+                "rulesetVersion": re.rulesetVersion,
+                "authority": re.authority,
+                "legalReference": re.legalReference,
+                "overallStatus": re.overallStatus,
+                "minConfidence": re.minConfidence,
+                "summary": re.summary,
+                "evaluatedAt": re.evaluatedAt,
+            }
+
+    if includeFindings:
+        rows = (
+            db.query(RuleResult)
+            .filter(RuleResult.inspectionId == inspectionId)
+            .order_by(RuleResult.createdAt)
+            .all()
+        )
+        response["ruleFindings"] = [
+            {
+                "id": r.id,
+                "rule": r.rule,
+                "ruleReference": r.ruleReference,
+                "title": r.title,
+                "legalReference": r.legalReference,
+                "status": r.status,
+                "reason": r.reason,
+                "severity": r.severity,
+                "reviewPolicy": r.reviewPolicy,
+                "createdAt": r.createdAt,
+            }
+            for r in rows
+        ]
+        response["ruleFindingCount"] = len(rows)
+
+    if includeVerification:
+        rows = (
+            db.query(VerificationResult)
+            .filter(VerificationResult.inspectionId == inspectionId)
+            .order_by(VerificationResult.createdAt)
+            .all()
+        )
+        response["verificationResults"] = [
+            {
+                "id": v.id,
+                "authority": v.authority,
+                "status": v.status,
+                "detail": v.detail,
+                "confidence": v.confidence,
+                "raw": v.raw,
+                "createdAt": v.createdAt,
+            }
+            for v in rows
+        ]
+
     return response
 
 
@@ -748,11 +940,14 @@ async def getInspections(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
     status: Optional[str] = Query(None),
+    verdict: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     q = db.query(Inspection)
     if status:
         q = q.filter(Inspection.status == status)
+    if verdict:
+        q = q.filter(Inspection.verdict == verdict)
 
     total = q.count()
     rows = q.order_by(Inspection.createdAt.desc()).offset(skip).limit(limit).all()
@@ -779,6 +974,7 @@ async def getInspections(
                 "verdict": r.verdict,
                 "status": r.status,
                 "createdAt": r.createdAt,
+                "completedAt": r.completedAt,
                 "imageCount": counts.get(r.id, 0),
             }
             for r in rows

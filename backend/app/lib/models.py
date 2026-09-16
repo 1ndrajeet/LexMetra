@@ -104,6 +104,7 @@ class Inspection(Base):
     status = Column(String, default="processing")
     createdAt = Column(DateTime, default=datetime.utcnow)
     completedAt = Column(DateTime, nullable=True)
+    preClassification = Column(JSON, nullable=True)
 
     user = relationship("User", back_populates="inspections")
     images = relationship("Image", back_populates="inspection", cascade="all, delete-orphan")
@@ -111,6 +112,13 @@ class Inspection(Base):
     ruleResults = relationship("RuleResult", back_populates="inspection", cascade="all, delete-orphan")
     reviews = relationship("Review", back_populates="inspection", cascade="all, delete-orphan")
     extractedProducts = relationship("ExtractedProduct", back_populates="inspection", cascade="all, delete-orphan")
+    verificationResults = relationship(
+        "VerificationResult", back_populates="inspection", cascade="all, delete-orphan",
+    )
+    ruleEvaluation = relationship(
+        "RuleEvaluation", back_populates="inspection",
+        uselist=False, cascade="all, delete-orphan",
+    )
 
 
 class Image(Base):
@@ -150,13 +158,57 @@ class RuleResult(Base):
     id = Column(String, primary_key=True, default=generate_uuid)
     inspectionId = Column(String, ForeignKey("Inspection.id", ondelete="CASCADE"), nullable=False)
     declarationId = Column(String, ForeignKey("Declaration.id", ondelete="SET NULL"), nullable=True)
+
     rule = Column(String, nullable=False)
+    ruleReference = Column(String, nullable=True)
+    title = Column(String, nullable=True)
+    legalReference = Column(Text, nullable=True)
     status = Column(String, nullable=False)
     reason = Column(Text, nullable=True)
+    severity = Column(String, nullable=True)
+    reviewPolicy = Column(String, nullable=True)
     createdAt = Column(DateTime, default=datetime.utcnow)
 
     inspection = relationship("Inspection", back_populates="ruleResults")
     declaration = relationship("Declaration", back_populates="ruleResults")
+
+
+class RuleEvaluation(Base):
+    __tablename__ = "RuleEvaluation"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    inspectionId = Column(
+        String,
+        ForeignKey("Inspection.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    rulesetId = Column(String, nullable=True)
+    rulesetVersion = Column(String, nullable=True)
+    authority = Column(String, nullable=True)
+    legalReference = Column(Text, nullable=True)
+    overallStatus = Column(String, nullable=False)
+    minConfidence = Column(Float, nullable=True)
+    summary = Column(JSON, nullable=True)
+    evaluatedAt = Column(DateTime, default=datetime.utcnow)
+
+    inspection = relationship("Inspection", back_populates="ruleEvaluation")
+
+
+class VerificationResult(Base):
+    __tablename__ = "VerificationResult"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    inspectionId = Column(String, ForeignKey("Inspection.id", ondelete="CASCADE"), nullable=False)
+
+    authority = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    detail = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)
+    raw = Column(JSON, nullable=True)
+    createdAt = Column(DateTime, default=datetime.utcnow)
+
+    inspection = relationship("Inspection", back_populates="verificationResults")
 
 
 class Review(Base):

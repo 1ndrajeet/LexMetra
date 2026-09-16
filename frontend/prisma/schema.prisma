@@ -26,6 +26,8 @@ model User {
   accounts    Account[]
   inspections Inspection[]
   reviews     Review[]
+
+  complaints Complaint[]
 }
 
 model Session {
@@ -84,11 +86,21 @@ model Inspection {
   createdAt       DateTime  @default(now())
   completedAt     DateTime?
 
-  images            Image[]
-  declarations      Declaration[]
-  ruleResults       RuleResult[]
-  reviews           Review[]
-  extractedProducts ExtractedProduct[]
+  // NEW: classification computed on the client by Gemini before upload
+  preClassification Json?
+
+  images              Image[]
+  declarations        Declaration[]
+  ruleResults         RuleResult[]
+  reviews             Review[]
+  extractedProducts   ExtractedProduct[]
+  verificationResults VerificationResult[]
+  ruleEvaluation      RuleEvaluation?
+
+  @@index([verdict])
+  @@index([status])
+  @@index([createdAt])
+  complaints Complaint[]
 }
 
 model Image {
@@ -100,6 +112,8 @@ model Image {
   createdAt    DateTime   @default(now())
 
   declarations Declaration[]
+
+  @@index([inspectionId])
 }
 
 model Declaration {
@@ -116,6 +130,9 @@ model Declaration {
   createdAt     DateTime    @default(now())
 
   ruleResults RuleResult[]
+
+  @@index([inspectionId])
+  @@index([field])
 }
 
 model RuleResult {
@@ -124,10 +141,21 @@ model RuleResult {
   inspection    Inspection   @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
   declarationId String?
   declaration   Declaration? @relation(fields: [declarationId], references: [id], onDelete: SetNull)
-  rule          String
-  status        String
-  reason        String?      @db.Text
-  createdAt     DateTime     @default(now())
+
+  // NEW: full metadata from the rule engine
+  rule           String
+  ruleReference  String?
+  title          String?
+  legalReference String?  @db.Text
+  status         String
+  reason         String?  @db.Text
+  severity       String?
+  reviewPolicy   String?
+  createdAt      DateTime @default(now())
+
+  @@index([inspectionId])
+  @@index([inspectionId, status])
+  @@index([inspectionId, severity])
 }
 
 model Review {
@@ -139,6 +167,43 @@ model Review {
   verdictOverride String?
   notes           String?    @db.Text
   createdAt       DateTime   @default(now())
+
+  @@index([inspectionId])
+}
+
+// NEW: one row per inspection, holds the engine's top-level output
+model RuleEvaluation {
+  id            String     @id @default(cuid())
+  inspectionId  String     @unique
+  inspection    Inspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+
+  rulesetId      String?
+  rulesetVersion String?
+  authority      String?
+  legalReference String?  @db.Text
+  overallStatus  String
+  minConfidence  Float?
+  summary        Json?
+  evaluatedAt    DateTime @default(now())
+
+  @@index([overallStatus])
+}
+
+// NEW: one row per authority (FSSAI, GST, BIS, ...) per inspection
+model VerificationResult {
+  id            String     @id @default(cuid())
+  inspectionId  String
+  inspection    Inspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+
+  authority  String
+  status     String
+  detail     String?  @db.Text
+  confidence Float?
+  raw        Json?
+  createdAt  DateTime @default(now())
+
+  @@index([inspectionId])
+  @@index([inspectionId, authority])
 }
 
 // ============================================================
@@ -210,6 +275,8 @@ model ExtractedProduct {
   updatedAt        DateTime  @updatedAt
 
   extractedFields ExtractedField[]
+
+  @@index([inspectionId])
 }
 
 model ExtractedField {
@@ -222,4 +289,30 @@ model ExtractedField {
   confidence Float?
   sourceText String?  @db.Text
   createdAt  DateTime @default(now())
+
+  @@index([extractedProductId])
+}
+
+// prisma/schema.prisma — add to CORE APP section
+
+model Complaint {
+  id            String     @id @default(cuid())
+  inspectionId  String
+  inspection    Inspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  userId        String?
+  user          User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  category      String     // "MISLABELING" | "QUANTITY" | "PRICE" | "LICENSE" | "OTHER"
+  severity      String     // "LOW" | "MEDIUM" | "HIGH"
+  title         String
+  description   String     @db.Text
+  contactEmail  String?
+  contactPhone  String?
+  status        String     @default("OPEN")  // OPEN | UNDER_REVIEW | RESOLVED | REJECTED
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  @@index([inspectionId])
+  @@index([status])
+  @@index([createdAt])
 }
