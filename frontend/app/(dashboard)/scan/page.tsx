@@ -21,7 +21,7 @@ import { useEffect, useRef, useState } from "react"
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000"
 const GEMINI_KEY = process.env.NEXT_PUBLIC_GEMINI_API_KEY
-const GEMINI_MODEL = "gemini-2.5-flash"
+const GEMINI_MODEL = "gemini-3.6-flash"
 const MAX_SHOTS = 3
 
 // ─── Types ──────────────────────────────────────────────────────────────────

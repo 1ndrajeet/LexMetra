@@ -2,9 +2,11 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { authClient } from "@/lib/auth-client";
 import {
   ArrowRight,
   CheckCircle2,
@@ -20,10 +22,24 @@ import {
   Users,
   Menu,
   X,
+  LayoutDashboard,
+  LogIn,
 } from "lucide-react";
 
 export default function LandingPage() {
   const [mobileOpen, setMobileOpen] = useState(false);
+  const router = useRouter();
+
+  const { data: session, isPending } = authClient.useSession();
+  const isLoggedIn = !!session?.user;
+
+  const handlePrimaryAction = () => {
+    if (isLoggedIn) {
+      router.push("/home");
+    } else {
+      router.push("/sign-in");
+    }
+  };
 
   return (
     <div className="min-h-screen bg-[#EDEFE9] text-[#12192B] font-sans antialiased">
@@ -48,12 +64,41 @@ export default function LandingPage() {
             </nav>
 
             <div className="flex items-center gap-3">
-              <Button variant="default" className="hidden md:inline-flex bg-[#12192B] hover:bg-[#232D45] text-[#FBFAF5] rounded-[3px]">
-                See a demo inspection
-              </Button>
+              {/* Auth-aware desktop CTA */}
+              {!isPending && (
+                isLoggedIn ? (
+                  <Button
+                    variant="default"
+                    onClick={() => router.push("/home")}
+                    className="hidden md:inline-flex bg-[#12192B] hover:bg-[#232D45] text-[#FBFAF5] rounded-[3px]"
+                  >
+                    <LayoutDashboard className="w-4 h-4 mr-2" />
+                    Go to Dashboard
+                  </Button>
+                ) : (
+                  <div className="hidden md:flex items-center gap-3">
+                    <Button
+                      variant="ghost"
+                      onClick={() => router.push("/sign-in")}
+                      className="text-[#4A5468] hover:text-[#12192B] hover:bg-transparent"
+                    >
+                      Sign in
+                    </Button>
+                    <Button
+                      variant="default"
+                      onClick={() => router.push("/sign-up")}
+                      className="bg-[#12192B] hover:bg-[#232D45] text-[#FBFAF5] rounded-[3px]"
+                    >
+                      Get started
+                    </Button>
+                  </div>
+                )
+              )}
+
               <button
                 onClick={() => setMobileOpen(!mobileOpen)}
                 className="md:hidden p-2 border border-[#B9BBAC] rounded-[3px]"
+                aria-label="Toggle menu"
               >
                 {mobileOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
               </button>
@@ -68,7 +113,37 @@ export default function LandingPage() {
               <a href="#how-it-works" className="py-3 text-[#4A5468] font-medium border-b border-[#D3D5C8]">How it works</a>
               <a href="#verdicts" className="py-3 text-[#4A5468] font-medium border-b border-[#D3D5C8]">Verdicts</a>
               <a href="#trust" className="py-3 text-[#4A5468] font-medium border-b border-[#D3D5C8]">Why trust it</a>
-              <Button variant="default" className="mt-4 bg-[#12192B] hover:bg-[#232D45] text-[#FBFAF5]">See a demo inspection</Button>
+
+              {!isPending && (
+                isLoggedIn ? (
+                  <Button
+                    variant="default"
+                    onClick={() => router.push("/home")}
+                    className="mt-4 bg-[#12192B] hover:bg-[#232D45] text-[#FBFAF5]"
+                  >
+                    <LayoutDashboard className="w-4 h-4 mr-2" />
+                    Go to Dashboard
+                  </Button>
+                ) : (
+                  <div className="flex flex-col gap-2 mt-4">
+                    <Button
+                      variant="outline"
+                      onClick={() => router.push("/sign-in")}
+                      className="border-[#B9BBAC] text-[#12192B]"
+                    >
+                      <LogIn className="w-4 h-4 mr-2" />
+                      Sign in
+                    </Button>
+                    <Button
+                      variant="default"
+                      onClick={() => router.push("/sign-up")}
+                      className="bg-[#12192B] hover:bg-[#232D45] text-[#FBFAF5]"
+                    >
+                      Get started
+                    </Button>
+                  </div>
+                )
+              )}
             </div>
           )}
         </div>
@@ -89,10 +164,19 @@ export default function LandingPage() {
                 LEXMETRA extracts every mandatory declaration from a photo of a package and verifies it, field by field, against Rule 6. No manual cross-checking, no guesswork on ambiguous cases.
               </p>
               <div className="flex flex-wrap gap-3.5 mt-8">
-                <Button variant="default" className="bg-[#12192B] hover:bg-[#232D45] text-[#FBFAF5]">
-                  Watch an inspection run
+                <Button
+                  variant="default"
+                  onClick={handlePrimaryAction}
+                  className="bg-[#12192B] hover:bg-[#232D45] text-[#FBFAF5]"
+                >
+                  {isLoggedIn ? "Go to Dashboard" : "Get started free"}
+                  <ArrowRight className="w-4 h-4 ml-2" />
                 </Button>
-                <Button variant="outline" className="border-[#B9BBAC] hover:border-[#12192B] text-[#12192B]">
+                <Button
+                  variant="outline"
+                  onClick={() => router.push("/home")}
+                  className="border-[#B9BBAC] hover:border-[#12192B] text-[#12192B]"
+                >
                   See what Rule 6 requires
                 </Button>
               </div>
@@ -403,17 +487,23 @@ export default function LandingPage() {
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-6">
             <div>
               <h2 className="font-serif font-semibold text-2xl md:text-3xl text-[#FBFAF5]">
-                Run an inspection in under a minute
+                {isLoggedIn ? "Continue where you left off" : "Run an inspection in under a minute"}
               </h2>
               <p className="mt-2 text-[1.05rem] text-[#B7BDCC] max-w-lg">
-                Try any of the three demo cases and see the full evidence trail behind each verdict.
+                {isLoggedIn
+                  ? "Head to your dashboard to run a new inspection or review past verdicts."
+                  : "Try any of the three demo cases and see the full evidence trail behind each verdict."}
               </p>
               <p className="mt-5 text-[0.78rem] text-[#8891A5]">
                 Built by Team The Inspectors for Smart India Hackathon 2026 — Problem Statement 26034.
               </p>
             </div>
-            <Button variant="default" className="bg-[#FBFAF5] text-[#12192B] hover:bg-white">
-              Try a demo case
+            <Button
+              variant="default"
+              onClick={handlePrimaryAction}
+              className="bg-[#FBFAF5] text-[#12192B] hover:bg-white"
+            >
+              {isLoggedIn ? "Go to Dashboard" : "Try a demo case"}
               <ArrowRight className="w-4 h-4 ml-2" />
             </Button>
           </div>

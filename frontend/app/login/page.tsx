@@ -40,7 +40,7 @@ export default function LoginPage() {
         setError(error.message || "Invalid credentials");
         setLoading(false);
       } else {
-        router.push("/");
+        router.push("/home");
       }
     } else {
       const { error } = await authClient.signUp.email({ email, password, name });
@@ -48,11 +48,12 @@ export default function LoginPage() {
         setError(error.message || "Registration failed");
         setLoading(false);
       } else {
-        router.push("/");
+        router.push("/home");
       }
     }
   };
 
+  
   return (
     <div className="min-h-screen bg-slate-50 flex">
       {/* Left Side - Brand */}
