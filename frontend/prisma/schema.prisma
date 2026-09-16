@@ -1,3 +1,4 @@
+// prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
@@ -5,6 +6,10 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+// ============================================================
+// AUTH (Better Auth)
+// ============================================================
 
 model User {
   id            String    @id @default(cuid())
@@ -16,27 +21,29 @@ model User {
   role          String    @default("inspector")
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
-  
-  sessions      Session[]
-  accounts      Account[]
+
+  sessions    Session[]
+  accounts    Account[]
+  inspections Inspection[]
+  reviews     Review[]
 }
 
 model Session {
-  id           String   @id @default(cuid())
-  userId       String
-  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  token        String   @unique
-  expiresAt    DateTime
-  ipAddress    String?
-  userAgent    String?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model Account {
-  id                    String   @id @default(cuid())
+  id                    String    @id @default(cuid())
   userId                String
-  user                  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   accountId             String
   providerId            String
   providerType          String?
@@ -47,8 +54,8 @@ model Account {
   refreshTokenExpiresAt DateTime?
   scope                 String?
   password              String?
-  createdAt             DateTime @default(now())
-  updatedAt             DateTime @updatedAt
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
 }
 
 model Verification {
@@ -58,4 +65,161 @@ model Verification {
   expiresAt  DateTime
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
+}
+
+// ============================================================
+// CORE APP
+// ============================================================
+
+model Inspection {
+  id              String    @id @default(cuid())
+  userId          String?
+  user            User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  productName     String?
+  saleType        String?   @default("retail")
+  productCategory String?
+  verdict         String    @default("PENDING")
+  score           Float?
+  status          String    @default("processing")
+  createdAt       DateTime  @default(now())
+  completedAt     DateTime?
+
+  images            Image[]
+  declarations      Declaration[]
+  ruleResults       RuleResult[]
+  reviews           Review[]
+  extractedProducts ExtractedProduct[]
+}
+
+model Image {
+  id           String     @id @default(cuid())
+  inspectionId String
+  inspection   Inspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  url          String     @db.Text
+  orderNum     Int
+  createdAt    DateTime   @default(now())
+
+  declarations Declaration[]
+}
+
+model Declaration {
+  id            String      @id @default(cuid())
+  inspectionId  String
+  inspection    Inspection  @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  field         String
+  value         String?     @db.Text
+  confidence    Float?
+  status        String
+  sourceImageId String?
+  sourceImage   Image?      @relation(fields: [sourceImageId], references: [id], onDelete: SetNull)
+  bbox          Json?
+  createdAt     DateTime    @default(now())
+
+  ruleResults RuleResult[]
+}
+
+model RuleResult {
+  id            String       @id @default(cuid())
+  inspectionId  String
+  inspection    Inspection   @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  declarationId String?
+  declaration   Declaration? @relation(fields: [declarationId], references: [id], onDelete: SetNull)
+  rule          String
+  status        String
+  reason        String?      @db.Text
+  createdAt     DateTime     @default(now())
+}
+
+model Review {
+  id              String     @id @default(cuid())
+  inspectionId    String
+  inspection      Inspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+  userId          String?
+  user            User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  verdictOverride String?
+  notes           String?    @db.Text
+  createdAt       DateTime   @default(now())
+}
+
+// ============================================================
+// EXTRACTED PRODUCT DATA
+// ============================================================
+
+model ExtractedProduct {
+  id           String     @id @default(cuid())
+  inspectionId String
+  inspection   Inspection @relation(fields: [inspectionId], references: [id], onDelete: Cascade)
+
+  productName String?
+  brand       String?
+  genericName String?
+  commonName  String?
+
+  productCategory        String?
+  productSubcategory     String?
+  commodityType          String?
+  commodityPhysicalState String?
+
+  manufacturer        String?
+  manufacturerAddress String? @db.Text
+  packer              String?
+  packerAddress       String? @db.Text
+  importer            String?
+  importerAddress     String? @db.Text
+  countryOfOrigin     String?
+
+  mrp         Float?
+  mrpCurrency String? @default("INR")
+  mrpRawText  String? @db.Text
+
+  netQuantityValue   Float?
+  netQuantityUnit    String?
+  netQuantityRawText String? @db.Text
+
+  batchNumber      String?
+  manufacturedDate String?
+  packedDate       String?
+  importedDate     String?
+  expiryDate       String?
+  bestBeforeDate   String?
+
+  fssaiLicense        String?
+  ingredients         String? @db.Text
+  nutritionalInfo     String? @db.Text
+  storageInstructions String? @db.Text
+  usageInstructions   String? @db.Text
+
+  customerCare        String? @db.Text
+  customerCarePhone   String?
+  customerCareEmail   String?
+  customerCareAddress String? @db.Text
+  website             String?
+  productCode         String?
+
+  declarationLanguage String?
+  declarationOnPdp    Boolean?
+
+  finishedDimensions String?
+  usableSheetsCount  Int?
+  sheetDimensions    String?
+
+  rawTextUsed      String?   @db.Text
+  confidenceScore  Float?
+  extractionStatus String    @default("pending")
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  extractedFields ExtractedField[]
+}
+
+model ExtractedField {
+  id                 String           @id @default(cuid())
+  extractedProductId String
+  extractedProduct   ExtractedProduct @relation(fields: [extractedProductId], references: [id], onDelete: Cascade)
+
+  fieldName  String
+  fieldValue String?  @db.Text
+  confidence Float?
+  sourceText String?  @db.Text
+  createdAt  DateTime @default(now())
 }

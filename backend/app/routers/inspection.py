@@ -1,10 +1,11 @@
 # backend/app/routers/inspection.py
 """
 LexMetra inspection router — single file pipeline.
-PaddleOCR -> Gemini 2.5 Flash -> structured facts -> DB.
+PaddleOCR -> Gemini 2.5 Flash -> structured facts -> rule engine.
+camelCase end to end for the DB layer; the rule engine returns snake_case
+keys, which is why the two reads near the bottom use snake_case.
 """
 import os
-# MUST be set before importing paddle
 os.environ["FLAGS_use_mkldnn"] = "0"
 os.environ["FLAGS_enable_mkldnn"] = "0"
 
@@ -15,7 +16,6 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, List
-from app.services.rules import evaluate as evaluate_rules
 
 from fastapi import APIRouter, HTTPException, Depends, Path, Query
 from sqlalchemy.orm import Session
@@ -27,22 +27,24 @@ from app.lib.models import (
     Inspection, Image, Declaration,
     ExtractedProduct, ExtractedField,
 )
+from app.services.rules import evaluate as evaluate_rules
+from app.services.verification import verify_all
 from app.lib.logger import VERBOSE, Timer
+
 logger = logging.getLogger("lexmetra.inspection")
 
 load_dotenv()
 router = APIRouter()
 
-# ============================================================
-# CONFIG
-# ============================================================
-GEMINI_MODELS = ["gemini-3.8-flash","gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+
 # ============================================================
-# GEMINI CLIENT (lazy)
+# GEMINI CLIENT
 # ============================================================
 _gemini_client = None
+
 
 def _get_gemini():
     global _gemini_client
@@ -58,22 +60,22 @@ def _get_gemini():
 # OCR (PaddleOCR 3.x)
 # ============================================================
 @dataclass
-class OCRField:
+class OcrField:
     value: str
     confidence: float
-    bbox: Optional[List[int]] = None   # [x, y, w, h]
+    bbox: Optional[List[int]] = None
 
 
 @dataclass
-class OCRResult:
-    raw_text: str = ""
-    fields: List[OCRField] = field(default_factory=list)
+class OcrResult:
+    rawText: str = ""
+    fields: List[OcrField] = field(default_factory=list)
     confidence: float = 0.0
     success: bool = False
     error: Optional[str] = None
 
 
-class PaddleOCRExtractor:
+class PaddleOcrExtractor:
     _instance = None
 
     def __new__(cls):
@@ -95,16 +97,16 @@ class PaddleOCRExtractor:
             )
         return self._ocr
 
-    def extract(self, image_path: str) -> OCRResult:
-        result = OCRResult()
+    def extract(self, imagePath: str) -> OcrResult:
+        result = OcrResult()
         try:
-            pages = self.ocr.predict(image_path)
+            pages = self.ocr.predict(imagePath)
             if not pages:
                 result.error = "No OCR results"
                 return result
 
-            all_text: List[str] = []
-            fields: List[OCRField] = []
+            allText: List[str] = []
+            fields: List[OcrField] = []
 
             for page in pages:
                 texts = page.get("rec_texts")
@@ -127,7 +129,6 @@ class PaddleOCRExtractor:
                     if i < len(boxes):
                         try:
                             box = boxes[i]
-                            # rec_boxes: [x1, y1, x2, y2]
                             if hasattr(box, "tolist"):
                                 box = box.tolist()
                             if len(box) >= 4:
@@ -139,10 +140,10 @@ class PaddleOCRExtractor:
                         except Exception:
                             bbox = None
 
-                    all_text.append(text)
-                    fields.append(OCRField(value=text, confidence=conf, bbox=bbox))
+                    allText.append(text)
+                    fields.append(OcrField(value=text, confidence=conf, bbox=bbox))
 
-            result.raw_text = " ".join(all_text)
+            result.rawText = " ".join(allText)
             result.fields = fields
             result.confidence = (
                 sum(f.confidence for f in fields) / len(fields) if fields else 0.0
@@ -150,75 +151,80 @@ class PaddleOCRExtractor:
             result.success = True
 
         except Exception as e:
-            logger.exception("OCR failed for %s", image_path)
+            logger.exception("OCR failed for %s", imagePath)
             result.error = str(e)
             result.success = False
 
         return result
 
 
-def extract_from_image(path: str) -> OCRResult:
-    return PaddleOCRExtractor().extract(path)
+def extractFromImage(path: str) -> OcrResult:
+    return PaddleOcrExtractor().extract(path)
 
 
 # ============================================================
-# GEMINI EXTRACTION
+# GEMINI EXTRACTION PROMPT — camelCase output
 # ============================================================
 EXTRACTION_PROMPT = """You are a product label extraction and classification engine for Legal Metrology compliance under the Legal Metrology (Packaged Commodities) Rules, 2011 (India).
 
 You are given OCR text extracted from ONE OR MORE photographs of the SAME packaged commodity. Combine information across them. Extract ONLY what is visibly present.
 
-Return ONLY valid JSON:
+Return ONLY valid JSON with camelCase keys:
 {
-  "product_name": "string|null",
+  "productName": "string|null",
   "brand": "string|null",
-  "product_category": "string|null",
-  "product_subcategory": "string|null",
+  "genericName": "string|null",
+  "commonName": "string|null",
+  "productCategory": "string|null",
+  "productSubcategory": "string|null",
+  "commodityType": "string|null",
+  "commodityPhysicalState": "solid|semiSolid|viscous|liquid|solidAndLiquidMix|linear|area|count|null",
   "manufacturer": "string|null",
-  "manufacturer_address": "string|null",
+  "manufacturerAddress": "string|null",
   "packer": "string|null",
-  "packer_address": "string|null",
+  "packerAddress": "string|null",
   "importer": "string|null",
-  "importer_address": "string|null",
-  "country_of_origin": "string|null",
+  "importerAddress": "string|null",
+  "countryOfOrigin": "string|null",
   "mrp": number|null,
-  "mrp_currency": "INR",
-  "net_quantity": "string|null",
-  "net_quantity_unit": "g|kg|ml|l|...|null",
-  "batch_number": "string|null",
-  "manufacturing_date": "YYYY-MM-DD|null",
-  "expiry_date": "YYYY-MM-DD|null",
-  "best_before": "string|null",
-  "fssai_license": "string|null",
+  "mrpCurrency": "INR",
+  "mrpRawText": "string|null",
+  "netQuantityValue": number|null,
+  "netQuantityUnit": "g|kg|ml|l|...|null",
+  "netQuantityRawText": "string|null",
+  "batchNumber": "string|null",
+  "manufacturedDate": "YYYY-MM-DD|null",
+  "packedDate": "YYYY-MM-DD|null",
+  "importedDate": "YYYY-MM-DD|null",
+  "expiryDate": "YYYY-MM-DD|null",
+  "bestBeforeDate": "string|null",
+  "fssaiLicense": "string|null",
   "ingredients": "string|null",
-  "nutritional_info": "string|null",
-  "storage_instructions": "string|null",
-  "usage_instructions": "string|null",
-  "customer_care": "string|null",
+  "nutritionalInfo": "string|null",
+  "storageInstructions": "string|null",
+  "usageInstructions": "string|null",
+  "customerCare": "string|null",
+  "customerCarePhone": "string|null",
+  "customerCareEmail": "string|null",
+  "customerCareAddress": "string|null",
   "website": "string|null",
-  "product_code": "string|null"
+  "productCode": "string|null",
+  "declarationLanguage": "hi|en|other|null",
+  "declarationOnPdp": true|false|null,
+  "finishedDimensions": "string|null",
+  "usableSheetsCount": number|null,
+  "sheetDimensions": "string|null"
 }
 
-PRODUCT CATEGORY (India LMPC + FSSAI context):
-Pick the SINGLE best match for "product_category":
-  - "food"            (any edible item, beverage, snack, spice, oil, grain, dairy, sweet, etc.)
-  - "drug"            (medicine, pharmaceutical, formulation)
-  - "cosmetic"        (personal-care, soap, shampoo, cream, toothpaste)
-  - "medical_device"  (thermometer, glucose meter, etc.)
-  - "household"       (detergent, cleaner, non-edible consumable)
-  - "agricultural"    (seeds, fertilizer, pesticide)
-  - "industrial"      (raw material, tools, machinery)
-  - "other"           (if unclear)
-
-PRODUCT SUBCATEGORY: a short noun phrase describing the commodity
-  - examples: "instant coffee", "biscuits", "edible oil", "shampoo", "tablet"
-  - Do NOT use brand names here.
+PRODUCT CATEGORY:
+  - "food" | "drug" | "cosmetic" | "medicalDevice" | "household" | "agricultural" | "industrial" | "other"
 
 RULES:
 - NEVER invent values. Use null if not present.
 - MRP is the retail price, not unit price.
 - Dates must be ISO (YYYY-MM-DD). Month/year only → YYYY-MM-01.
 - Strip currency symbols from "mrp".
+- Return netQuantityValue as a NUMBER and netQuantityUnit separately.
 - Do NOT make any compliance decision.
 
 OCR TEXT:
@@ -229,12 +235,12 @@ OCR TEXT:
 JSON:"""
 
 
-def _extract_with_gemini(text: str) -> dict:
+def _extractWithGemini(text: str) -> dict:
     if not text or len(text.strip()) < 10:
         return {"success": False, "error": "Text too short", "data": {}}
 
     prompt = EXTRACTION_PROMPT.replace("{text}", text[:100000])
-    last_err = None
+    lastErr = None
 
     for model in GEMINI_MODELS:
         for attempt in (1, 2, 3):
@@ -256,39 +262,31 @@ def _extract_with_gemini(text: str) -> dict:
 
             except json.JSONDecodeError as e:
                 logger.error("Invalid JSON from %s: %s", model, e)
-                last_err = f"Invalid JSON: {e}"
-                break  # no point retrying same model for bad JSON
+                lastErr = f"Invalid JSON: {e}"
+                break
             except Exception as e:
-                last_err = str(e)
-                # Retry on 503/429, then fall through to next model
-                if "503" in last_err or "429" in last_err or "UNAVAILABLE" in last_err:
+                lastErr = str(e)
+                if "503" in lastErr or "429" in lastErr or "UNAVAILABLE" in lastErr:
                     import time
-                    wait = 2 ** attempt
-                    logger.warning(
-                        "Gemini %s busy (attempt %d/3) — waiting %ds",
-                        model, attempt, wait,
-                    )
-                    time.sleep(wait)
+                    time.sleep(2 ** attempt)
                     continue
                 logger.exception("Gemini failed with %s", model)
-                break  # non-retryable
+                break
 
-    return {"success": False, "error": last_err or "All models failed", "data": {}}
+    return {"success": False, "error": lastErr or "All models failed", "data": {}}
 
 
 # ============================================================
-# NORMALIZATION (snake_case -> DB camelCase)
+# NORMALIZATION
 # ============================================================
-def _clean_date(v):
+def _cleanDate(v):
     if not v:
         return None
     s = str(v).strip()
-    # Gemini already returns ISO — trust it
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
         return s
     if re.fullmatch(r"\d{4}-\d{2}", s):
         return f"{s}-01"
-    # Fallback: parse DD/MM/YY or DD/MM/YYYY (India = day-first)
     for pat in (
         r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})",
         r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})",
@@ -305,7 +303,7 @@ def _clean_date(v):
     return s
 
 
-def _clean_price(v):
+def _cleanPrice(v):
     if v is None:
         return None
     m = re.search(r"(\d+\.?\d*)", str(v))
@@ -316,69 +314,56 @@ def _clean_price(v):
     except (TypeError, ValueError):
         return None
 
-_FIELD_MAP = {
-    "product_name": "productName",
-    "brand": "brand",
-    "product_category": "productCategory",
-    "product_subcategory": "productSubcategory",
-    "manufacturer": "manufacturer",
-    "manufacturer_address": "manufacturerAddress",
-    "packer": "packer",
-    "packer_address": "packerAddress",
-    "importer": "importer",
-    "importer_address": "importerAddress",
-    "mrp": "mrp",
-    "mrp_currency": "mrpCurrency",
-    "net_quantity": "netQuantity",
-    "net_quantity_unit": "netQuantityUnit",
-    "batch_number": "batchNumber",
-    "manufacturing_date": "manufacturingDate",
-    "expiry_date": "expiryDate",
-    "best_before": "bestBefore",
-    "fssai_license": "fssaiLicense",
-    "ingredients": "ingredients",
-    "nutritional_info": "nutritionalInfo",
-    "usage_instructions": "usageInstructions",
-    "storage_instructions": "storageInstructions",
-    "country_of_origin": "countryOfOrigin",
-    "product_code": "productCode",
-    "website": "website",
-    "customer_care": "customerCare",
-}
+
+def _cleanQuantityValue(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    m = re.search(r"(\d+\.?\d*)", str(v))
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return None
 
 
 def _standardize(data: dict) -> dict:
+    """Clean Gemini's camelCase output. mrp -> float, dates -> ISO."""
     out = {}
     for k, v in (data or {}).items():
-        key = _FIELD_MAP.get(k, k)
         if k == "mrp":
-            v = _clean_price(v)
-        elif k in ("manufacturing_date", "expiry_date"):
-            v = _clean_date(v)
-        out[key] = v
+            v = _cleanPrice(v)
+        elif k in ("manufacturedDate", "packedDate", "importedDate",
+                   "expiryDate", "bestBeforeDate"):
+            v = _cleanDate(v)
+        elif k == "netQuantityValue":
+            v = _cleanQuantityValue(v)
+        out[k] = v
     return out
 
 
 # ============================================================
 # ROUTES
 # ============================================================
-@router.post("/inspect/{inspection_id}")
-async def inspect_images(
-    inspection_id: str = Path(...),
+@router.post("/inspect/{inspectionId}")
+async def inspectImages(
+    inspectionId: str = Path(...),
     db: Session = Depends(get_db),
 ):
     logger.info(f"{'='*60}")
-    logger.info(f"INSPECT START  id={inspection_id}")
+    logger.info(f"INSPECT START  id={inspectionId}")
     logger.info(f"{'='*60}")
 
     with Timer(logger, "Load inspection from DB"):
-        inspection = db.query(Inspection).filter(Inspection.id == inspection_id).first()
+        inspection = db.query(Inspection).filter(Inspection.id == inspectionId).first()
         if not inspection:
             raise HTTPException(404, "Inspection not found")
 
         images = (
             db.query(Image)
-            .filter(Image.inspectionId == inspection_id)
+            .filter(Image.inspectionId == inspectionId)
             .order_by(Image.orderNum)
             .all()
         )
@@ -386,22 +371,22 @@ async def inspect_images(
             raise HTTPException(400, "No images for this inspection")
 
         existing = db.query(ExtractedProduct).filter(
-            ExtractedProduct.inspectionId == inspection_id
+            ExtractedProduct.inspectionId == inspectionId
         ).first()
         if existing:
             logger.info(f"Already extracted → returning cached  status={existing.extractionStatus}")
             return {
                 "success": True,
-                "inspection_id": inspection_id,
+                "inspectionId": inspectionId,
                 "message": "Already extracted",
-                "extracted_product_id": existing.id,
-                "extraction_status": existing.extractionStatus,
+                "extractedProductId": existing.id,
+                "extractionStatus": existing.extractionStatus,
             }
 
     logger.info(f"Found {len(images)} image(s) to process")
 
-    processed, failed, text_parts = [], [], []
-    total_ocr_fields = 0
+    processed, failed, textParts = [], [], []
+    totalOcrFields = 0
 
     try:
         # ---------- 1. OCR ----------
@@ -414,19 +399,19 @@ async def inspect_images(
 
             if not os.path.exists(image.url):
                 logger.warning(f"    File missing — skipping")
-                failed.append({"image_id": image.id, "error": "File missing"})
+                failed.append({"imageId": image.id, "error": "File missing"})
                 continue
 
             with Timer(logger, f"    PaddleOCR on image {idx}"):
-                ocr = extract_from_image(image.url)
+                ocr = extractFromImage(image.url)
 
             if not ocr.success:
                 logger.error(f"    OCR failed: {ocr.error}")
-                failed.append({"image_id": image.id, "error": ocr.error})
+                failed.append({"imageId": image.id, "error": ocr.error})
                 continue
 
-            avg_conf = ocr.confidence
-            logger.info(f"    Extracted {len(ocr.fields)} lines  (avg conf={avg_conf:.2f})")
+            avgConf = ocr.confidence
+            logger.info(f"    Extracted {len(ocr.fields)} lines  (avg conf={avgConf:.2f})")
             if VERBOSE:
                 for f in ocr.fields[:5]:
                     logger.info(f"      • '{f.value[:60]}'  conf={f.confidence:.2f}  bbox={f.bbox}")
@@ -436,7 +421,7 @@ async def inspect_images(
             for idx2, f in enumerate(ocr.fields):
                 db.add(Declaration(
                     id=str(uuid.uuid4()),
-                    inspectionId=inspection_id,
+                    inspectionId=inspectionId,
                     field=f"text_line_{idx2 + 1}",
                     value=f.value,
                     confidence=f.confidence,
@@ -446,32 +431,32 @@ async def inspect_images(
                     createdAt=datetime.utcnow(),
                 ))
 
-            total_ocr_fields += len(ocr.fields)
-            text_parts.append(ocr.raw_text)
+            totalOcrFields += len(ocr.fields)
+            textParts.append(ocr.rawText)
             processed.append({
-                "image_id": image.id,
+                "imageId": image.id,
                 "url": image.url,
-                "text_count": len(ocr.fields),
+                "textCount": len(ocr.fields),
             })
 
-        if not text_parts:
+        if not textParts:
             raise HTTPException(400, "No text extracted from any image")
 
         db.commit()
-        logger.info(f"Committed {total_ocr_fields} OCR lines to DB")
+        logger.info(f"Committed {totalOcrFields} OCR lines to DB")
 
         # ---------- 2. Gemini ----------
         logger.info(f"{'-'*60}")
         logger.info(f"STEP 2 — Gemini structured extraction")
         logger.info(f"{'-'*60}")
 
-        full_text = " ".join(text_parts)
-        logger.info(f"Combined OCR text: {len(full_text)} chars")
+        fullText = " ".join(textParts)
+        logger.info(f"Combined OCR text: {len(fullText)} chars")
 
         extracted = ExtractedProduct(
             id=str(uuid.uuid4()),
-            inspectionId=inspection_id,
-            rawTextUsed=full_text[:10000],
+            inspectionId=inspectionId,
+            rawTextUsed=fullText[:10000],
             extractionStatus="processing",
             createdAt=datetime.utcnow(),
         )
@@ -480,7 +465,7 @@ async def inspect_images(
         db.refresh(extracted)
 
         with Timer(logger, "  Gemini call (with retries/fallbacks)"):
-            gem = _extract_with_gemini(full_text)
+            gem = _extractWithGemini(fullText)
 
         if not gem["success"]:
             logger.error(f"  Gemini failed: {gem.get('error')}")
@@ -494,7 +479,7 @@ async def inspect_images(
             structured = _standardize(gem["data"])
 
         if VERBOSE:
-            logger.info(f"  Extracted fields:")
+            logger.info(f"  Extracted fields (camelCase):")
             for k, v in structured.items():
                 vs = str(v)[:70] if v is not None else "null"
                 logger.info(f"    {k:24s} = {vs}")
@@ -507,25 +492,47 @@ async def inspect_images(
         with Timer(logger, "  Write ExtractedProduct"):
             extracted.productName = structured.get("productName")
             extracted.brand = structured.get("brand")
+            extracted.genericName = structured.get("genericName")
+            extracted.commonName = structured.get("commonName")
+            extracted.productCategory = structured.get("productCategory")
+            extracted.productSubcategory = structured.get("productSubcategory")
+            extracted.commodityType = structured.get("commodityType")
+            extracted.commodityPhysicalState = structured.get("commodityPhysicalState")
             extracted.manufacturer = structured.get("manufacturer")
             extracted.manufacturerAddress = structured.get("manufacturerAddress")
+            extracted.packer = structured.get("packer")
+            extracted.packerAddress = structured.get("packerAddress")
             extracted.importer = structured.get("importer")
+            extracted.importerAddress = structured.get("importerAddress")
+            extracted.countryOfOrigin = structured.get("countryOfOrigin")
             extracted.mrp = structured.get("mrp")
             extracted.mrpCurrency = structured.get("mrpCurrency") or "INR"
-            extracted.netQuantity = structured.get("netQuantity")
+            extracted.mrpRawText = structured.get("mrpRawText")
+            extracted.netQuantityValue = structured.get("netQuantityValue")
             extracted.netQuantityUnit = structured.get("netQuantityUnit")
+            extracted.netQuantityRawText = structured.get("netQuantityRawText")
             extracted.batchNumber = structured.get("batchNumber")
-            extracted.manufacturingDate = structured.get("manufacturingDate")
+            extracted.manufacturedDate = structured.get("manufacturedDate")
+            extracted.packedDate = structured.get("packedDate")
+            extracted.importedDate = structured.get("importedDate")
             extracted.expiryDate = structured.get("expiryDate")
+            extracted.bestBeforeDate = structured.get("bestBeforeDate")
             extracted.fssaiLicense = structured.get("fssaiLicense")
             extracted.ingredients = structured.get("ingredients")
             extracted.nutritionalInfo = structured.get("nutritionalInfo")
-            extracted.usageInstructions = structured.get("usageInstructions")
             extracted.storageInstructions = structured.get("storageInstructions")
-            extracted.countryOfOrigin = structured.get("countryOfOrigin")
-            extracted.productCode = structured.get("productCode")
-            extracted.website = structured.get("website")
+            extracted.usageInstructions = structured.get("usageInstructions")
             extracted.customerCare = structured.get("customerCare")
+            extracted.customerCarePhone = structured.get("customerCarePhone")
+            extracted.customerCareEmail = structured.get("customerCareEmail")
+            extracted.customerCareAddress = structured.get("customerCareAddress")
+            extracted.website = structured.get("website")
+            extracted.productCode = structured.get("productCode")
+            extracted.declarationLanguage = structured.get("declarationLanguage")
+            extracted.declarationOnPdp = structured.get("declarationOnPdp")
+            extracted.finishedDimensions = structured.get("finishedDimensions")
+            extracted.usableSheetsCount = structured.get("usableSheetsCount")
+            extracted.sheetDimensions = structured.get("sheetDimensions")
             extracted.confidenceScore = 0.85
             extracted.extractionStatus = "completed"
             extracted.updatedAt = datetime.utcnow()
@@ -548,43 +555,76 @@ async def inspect_images(
 
         logger.info(f"{'='*60}")
         logger.info(
-            f"INSPECT DONE  id={inspection_id}  "
+            f"INSPECT DONE  id={inspectionId}  "
             f"status={inspection.status}  fields={len(gem['data'])}"
         )
         logger.info(f"{'='*60}")
 
-        preview = full_text[:300] + ("..." if len(full_text) > 300 else "")
-        # ---------- 4. Rule engine ----------
+        preview = fullText[:300] + ("..." if len(fullText) > 300 else "")
+
+        # ---------- 4. Verification ----------
         logger.info(f"{'-'*60}")
-        logger.info(f"STEP 4 — LMPC rule engine")
+        logger.info(f"STEP 4 — External verification")
         logger.info(f"{'-'*60}")
 
-        with Timer(logger, "  Evaluate rules"):
-            rule_result = evaluate_rules(structured)
+        with Timer(logger, "  Verify FSSAI / GST"):
+            verification = verify_all(structured)
 
         if VERBOSE:
-            logger.info(f"  Overall: {rule_result['overall_status']}  "
-                        f"(P={rule_result['summary']['PASS']} "
-                        f"F={rule_result['summary']['FAIL']} "
-                        f"U={rule_result['summary']['UNCERTAIN']} "
-                        f"NA={rule_result['summary']['NOT_APPLICABLE']})")
-            for f in rule_result["findings"]:
-                logger.info(f"    [{f['status']:14s}] {f['rule_id']:35s} {f['reason']}")
+            for k, v in verification.items():
+                logger.info(f"    {k:8s} -> {v['status']:18s} {v['detail'][:60]}")
 
-        inspection.verdict = rule_result["overall_status"]
+        # ---------- 5. Rule engine ----------
+        logger.info(f"{'-'*60}")
+        logger.info(f"STEP 5 — LMPC rule engine")
+        logger.info(f"{'-'*60}")
+
+        factsForEngine = dict(structured)
+        factsForEngine["saleType"] = getattr(inspection, "saleType", None) or "retail"
+        factsForEngine["productCategory"] = (
+            factsForEngine.get("productCategory")
+            or getattr(inspection, "productCategory", None)
+            or "other"
+        )
+        factsForEngine["inspectionDate"] = (
+            inspection.createdAt.date().isoformat()
+            if getattr(inspection, "createdAt", None) else None
+        )
+
+        fieldConfidence = {k: 0.85 for k, v in structured.items() if v is not None}
+
+        with Timer(logger, "  Evaluate rules"):
+            ruleResult = evaluate_rules(
+                factsForEngine,
+                verification=verification,
+                field_confidence=fieldConfidence,
+            )
+
+        if VERBOSE:
+            logger.info(f"  Overall: {ruleResult['overallStatus']}  "
+                        f"(P={ruleResult['summary']['PASS']} "
+                        f"F={ruleResult['summary']['FAIL']} "
+                        f"U={ruleResult['summary']['UNCERTAIN']} "
+                        f"NA={ruleResult['summary']['NOT_APPLICABLE']})")
+            for f in ruleResult["findings"]:
+                logger.info(f"    [{f['status']:14s}] {f['ruleId']:35s} {f['reason']}")
+
+        inspection.verdict = ruleResult["overallStatus"]
         db.commit()
+
         return {
             "success": True,
-            "inspection_id": inspection_id,
-            "total_images": len(images),
+            "inspectionId": inspectionId,
+            "totalImages": len(images),
             "processed": processed,
             "failed": failed,
-            "total_ocr_fields": total_ocr_fields,
-            "text_preview": preview,
-            "extracted_product_id": extracted.id,
-            "extraction_status": extracted.extractionStatus,
-            "structured_data": structured,
-            "rule_evaluation": rule_result,
+            "totalOcrFields": totalOcrFields,
+            "textPreview": preview,
+            "extractedProductId": extracted.id,
+            "extractionStatus": extracted.extractionStatus,
+            "structuredData": structured,
+            "verification": verification,
+            "ruleEvaluation": ruleResult,
             "status": inspection.status,
         }
 
@@ -595,86 +635,108 @@ async def inspect_images(
         db.rollback()
         logger.exception("Inspection failed")
         raise HTTPException(500, f"Inspection failed: {e}")
-        
 
-@router.get("/inspection/{inspection_id}")
-async def get_inspection(
-    inspection_id: str,
-    include_declarations: bool = Query(False),
-    include_extracted: bool = Query(True),
+
+@router.get("/inspection/{inspectionId}")
+async def getInspection(
+    inspectionId: str,
+    includeDeclarations: bool = Query(False),
+    includeExtracted: bool = Query(True),
     db: Session = Depends(get_db),
 ):
-    inspection = db.query(Inspection).filter(Inspection.id == inspection_id).first()
+    inspection = db.query(Inspection).filter(Inspection.id == inspectionId).first()
     if not inspection:
         raise HTTPException(404, "Inspection not found")
 
     images = (
         db.query(Image)
-        .filter(Image.inspectionId == inspection_id)
+        .filter(Image.inspectionId == inspectionId)
         .order_by(Image.orderNum)
         .all()
     )
 
     response = {
         "id": inspection.id,
-        "product_name": inspection.productName,
+        "productName": inspection.productName,
         "verdict": inspection.verdict,
         "score": inspection.score,
         "status": inspection.status,
-        "created_at": inspection.createdAt,
-        "completed_at": inspection.completedAt,
-        "image_count": len(images),
+        "createdAt": inspection.createdAt,
+        "completedAt": inspection.completedAt,
+        "imageCount": len(images),
         "images": [
-            {"id": i.id, "url": i.url, "order": i.orderNum, "created_at": i.createdAt}
+            {"id": i.id, "url": i.url, "order": i.orderNum, "createdAt": i.createdAt}
             for i in images
         ],
     }
 
-    if include_declarations:
-        decls = db.query(Declaration).filter(Declaration.inspectionId == inspection_id).all()
+    if includeDeclarations:
+        decls = db.query(Declaration).filter(Declaration.inspectionId == inspectionId).all()
         response["declarations"] = [
             {
                 "id": d.id, "field": d.field, "value": d.value,
                 "confidence": d.confidence, "status": d.status,
-                "bbox": d.bbox, "created_at": d.createdAt,
+                "bbox": d.bbox, "createdAt": d.createdAt,
             }
             for d in decls
         ]
-        response["declaration_count"] = len(decls)
+        response["declarationCount"] = len(decls)
 
-    if include_extracted:
+    if includeExtracted:
         ex = db.query(ExtractedProduct).filter(
-            ExtractedProduct.inspectionId == inspection_id
+            ExtractedProduct.inspectionId == inspectionId
         ).first()
         if ex:
-            response["extracted_data"] = {
+            response["extractedData"] = {
                 "id": ex.id,
-                "extraction_status": ex.extractionStatus,
+                "extractionStatus": ex.extractionStatus,
                 "confidence": ex.confidenceScore,
-                "created_at": ex.createdAt,
-                "updated_at": ex.updatedAt,
+                "createdAt": ex.createdAt,
+                "updatedAt": ex.updatedAt,
                 "data": {
-                    "product_name": ex.productName,
+                    "productName": ex.productName,
                     "brand": ex.brand,
+                    "genericName": ex.genericName,
+                    "commonName": ex.commonName,
+                    "productCategory": ex.productCategory,
+                    "productSubcategory": ex.productSubcategory,
+                    "commodityType": ex.commodityType,
+                    "commodityPhysicalState": ex.commodityPhysicalState,
                     "manufacturer": ex.manufacturer,
-                    "manufacturer_address": ex.manufacturerAddress,
+                    "manufacturerAddress": ex.manufacturerAddress,
+                    "packer": ex.packer,
+                    "packerAddress": ex.packerAddress,
                     "importer": ex.importer,
+                    "importerAddress": ex.importerAddress,
+                    "countryOfOrigin": ex.countryOfOrigin,
                     "mrp": ex.mrp,
-                    "mrp_currency": ex.mrpCurrency,
-                    "net_quantity": ex.netQuantity,
-                    "net_quantity_unit": ex.netQuantityUnit,
-                    "batch_number": ex.batchNumber,
-                    "manufacturing_date": ex.manufacturingDate,
-                    "expiry_date": ex.expiryDate,
-                    "fssai_license": ex.fssaiLicense,
+                    "mrpCurrency": ex.mrpCurrency,
+                    "mrpRawText": ex.mrpRawText,
+                    "netQuantityValue": ex.netQuantityValue,
+                    "netQuantityUnit": ex.netQuantityUnit,
+                    "netQuantityRawText": ex.netQuantityRawText,
+                    "batchNumber": ex.batchNumber,
+                    "manufacturedDate": ex.manufacturedDate,
+                    "packedDate": ex.packedDate,
+                    "importedDate": ex.importedDate,
+                    "expiryDate": ex.expiryDate,
+                    "bestBeforeDate": ex.bestBeforeDate,
+                    "fssaiLicense": ex.fssaiLicense,
                     "ingredients": ex.ingredients,
-                    "nutritional_info": ex.nutritionalInfo,
-                    "usage_instructions": ex.usageInstructions,
-                    "storage_instructions": ex.storageInstructions,
-                    "country_of_origin": ex.countryOfOrigin,
-                    "product_code": ex.productCode,
+                    "nutritionalInfo": ex.nutritionalInfo,
+                    "storageInstructions": ex.storageInstructions,
+                    "usageInstructions": ex.usageInstructions,
+                    "customerCare": ex.customerCare,
+                    "customerCarePhone": ex.customerCarePhone,
+                    "customerCareEmail": ex.customerCareEmail,
+                    "customerCareAddress": ex.customerCareAddress,
                     "website": ex.website,
-                    "customer_care": ex.customerCare,
+                    "productCode": ex.productCode,
+                    "declarationLanguage": ex.declarationLanguage,
+                    "declarationOnPdp": ex.declarationOnPdp,
+                    "finishedDimensions": ex.finishedDimensions,
+                    "usableSheetsCount": ex.usableSheetsCount,
+                    "sheetDimensions": ex.sheetDimensions,
                 },
             }
 
@@ -682,7 +744,7 @@ async def get_inspection(
 
 
 @router.get("/inspections")
-async def get_inspections(
+async def getInspections(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
     status: Optional[str] = Query(None),
@@ -698,13 +760,13 @@ async def get_inspections(
 
     counts = {}
     if ids:
-        rows_c = (
+        rowsC = (
             db.query(Image.inspectionId, func.count(Image.id))
             .filter(Image.inspectionId.in_(ids))
             .group_by(Image.inspectionId)
             .all()
         )
-        counts = {c[0]: c[1] for c in rows_c}
+        counts = {c[0]: c[1] for c in rowsC}
 
     return {
         "total": total,
@@ -713,24 +775,24 @@ async def get_inspections(
         "inspections": [
             {
                 "id": r.id,
-                "product_name": r.productName,
+                "productName": r.productName,
                 "verdict": r.verdict,
                 "status": r.status,
-                "created_at": r.createdAt,
-                "image_count": counts.get(r.id, 0),
+                "createdAt": r.createdAt,
+                "imageCount": counts.get(r.id, 0),
             }
             for r in rows
         ],
     }
 
 
-@router.delete("/inspection/{inspection_id}")
-async def delete_inspection(inspection_id: str, db: Session = Depends(get_db)):
-    inspection = db.query(Inspection).filter(Inspection.id == inspection_id).first()
+@router.delete("/inspection/{inspectionId}")
+async def deleteInspection(inspectionId: str, db: Session = Depends(get_db)):
+    inspection = db.query(Inspection).filter(Inspection.id == inspectionId).first()
     if not inspection:
         raise HTTPException(404, "Inspection not found")
     try:
-        images = db.query(Image).filter(Image.inspectionId == inspection_id).all()
+        images = db.query(Image).filter(Image.inspectionId == inspectionId).all()
         deleted = 0
         for img in images:
             if os.path.exists(img.url):
@@ -740,9 +802,9 @@ async def delete_inspection(inspection_id: str, db: Session = Depends(get_db)):
         db.commit()
         return {
             "success": True,
-            "message": f"Inspection {inspection_id} deleted",
-            "deleted_images": deleted,
-            "total_images": len(images),
+            "message": f"Inspection {inspectionId} deleted",
+            "deletedImages": deleted,
+            "totalImages": len(images),
         }
     except Exception as e:
         db.rollback()

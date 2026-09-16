@@ -1,0 +1,50 @@
+```bash
+# Enter database directory
+cd ~/Projects/LexMetra/database
+
+# Create persistent storage
+mkdir -p postgres-data
+
+# Start PostgreSQL
+docker run -d \
+  --name lexmetra-postgres \
+  -e POSTGRES_USER=lexmetra \
+  -e POSTGRES_PASSWORD=lexmetra \
+  -e POSTGRES_DB=lexmetra \
+  -p 5433:5432 \
+  -v "$(pwd)/postgres-data:/var/lib/postgresql/data" \
+  postgres:16
+
+# Status
+docker ps
+
+# Logs
+docker logs -f lexmetra-postgres
+
+# Connect
+docker exec -it lexmetra-postgres psql -U lexmetra -d lexmetra
+
+# Tables
+docker exec -it lexmetra-postgres psql -U lexmetra -d lexmetra -c '\dt'
+
+docker exec -it lexmetra-postgres psql -U lexmetra -d lexmetra -c '
+TRUNCATE TABLE
+  "Account",
+  "Declaration",
+  "Image",
+  "Inspection",
+  "Review",
+  "RuleResult",
+  "Session",
+  "User",
+  "Verification"
+RESTART IDENTITY CASCADE;
+'
+
+# Stop / Start
+docker stop lexmetra-postgres
+docker start lexmetra-postgres
+
+# Connection URL
+# postgresql://lexmetra:lexmetra@localhost:5433/lexmetra
+```

@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import { InspectionApp } from "@/components/inspection";
 import { LogoutButton } from "@/components/misc/LogoutButton";
 import { Layout } from "@/components/layout/Layout";
+import LandingPage from "@/components/layout/Landing";
 
 export default async function Home() {
   const session = await auth.api.getSession({
@@ -15,9 +16,6 @@ export default async function Home() {
   }
 
   return <>
-    {/* <LogoutButton /> */}
-    {/* <Layout> */}
-      <InspectionApp />
-    {/* </Layout> */}
+    <LandingPage/>
   </>;
 }
