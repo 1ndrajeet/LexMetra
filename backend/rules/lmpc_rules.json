@@ -1,0 +1,91 @@
+{
+  "ruleset_version": "LMPC-2011.1",
+  "effective_from": "2011-04-01",
+  "authority": "Department of Consumer Affairs, Government of India",
+  "legal_reference": "Legal Metrology (Packaged Commodities) Rules, 2011",
+  "notes": "Baseline ruleset for packaged commodity declarations. Extend for amendments.",
+
+  "rules": [
+    {
+      "rule_id": "LMPC-R6-1A-MANUFACTURER",
+      "description": "Name and address of manufacturer / packer / importer must be declared.",
+      "legal_reference": "Rule 6(1)(a)",
+      "applies_when": { "productCategory": "any" },
+      "required_fields": ["manufacturer", "manufacturerAddress"],
+      "validation": "both_present",
+      "on_missing": "FAIL"
+    },
+    {
+      "rule_id": "LMPC-R6-1B-COMMON_NAME",
+      "description": "Generic / common name of the commodity must be declared.",
+      "legal_reference": "Rule 6(1)(b)",
+      "applies_when": { "productCategory": "any" },
+      "required_fields": ["productName"],
+      "validation": "present",
+      "on_missing": "FAIL"
+    },
+    {
+      "rule_id": "LMPC-R6-1C-NET_QUANTITY",
+      "description": "Net quantity must be declared in standard units.",
+      "legal_reference": "Rule 6(1)(c)",
+      "applies_when": { "productCategory": "any" },
+      "required_fields": ["netQuantity", "netQuantityUnit"],
+      "validation": "both_present",
+      "on_missing": "FAIL"
+    },
+    {
+      "rule_id": "LMPC-R6-1D-MFG_DATE",
+      "description": "Month and year of manufacture / packing / import must be declared.",
+      "legal_reference": "Rule 6(1)(d)",
+      "applies_when": { "productCategory": "any" },
+      "required_fields": ["manufacturingDate"],
+      "validation": "date_valid",
+      "on_missing": "FAIL"
+    },
+    {
+      "rule_id": "LMPC-R6-1E-MRP",
+      "description": "Retail sale price (MRP) must be declared.",
+      "legal_reference": "Rule 6(1)(e)",
+      "applies_when": { "productCategory": "any" },
+      "required_fields": ["mrp"],
+      "validation": "positive_number",
+      "on_missing": "FAIL"
+    },
+    {
+      "rule_id": "LMPC-R6-1F-CONSUMER_CARE",
+      "description": "Consumer care contact details must be declared.",
+      "legal_reference": "Rule 6(1)(f)",
+      "applies_when": { "productCategory": "any" },
+      "required_fields": ["customerCare"],
+      "validation": "present",
+      "on_missing": "UNCERTAIN"
+    },
+    {
+      "rule_id": "LMPC-R6-1-BATCH",
+      "description": "Batch / lot / code number for traceability.",
+      "legal_reference": "Rule 6(1) / FSSAI 2.2.2",
+      "applies_when": { "productCategory": "any" },
+      "required_fields": ["batchNumber"],
+      "validation": "present",
+      "on_missing": "UNCERTAIN"
+    },
+    {
+      "rule_id": "LMPC-R6-1-FSSAI",
+      "description": "FSSAI license number required for food commodities.",
+      "legal_reference": "FSSAI Act 2006, Section 31",
+      "applies_when": { "productCategory": "food" },
+      "required_fields": ["fssaiLicense"],
+      "validation": "present",
+      "on_missing": "UNCERTAIN"
+    },
+    {
+      "rule_id": "LMPC-R6-1-COUNTRY",
+      "description": "Country of origin required for imported commodities.",
+      "legal_reference": "Rule 6(1)(a) proviso",
+      "applies_when": { "productCategory": "any", "isImported": true },
+      "required_fields": ["countryOfOrigin"],
+      "validation": "present",
+      "on_missing": "FAIL"
+    }
+  ]
+}

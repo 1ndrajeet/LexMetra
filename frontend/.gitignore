@@ -16,7 +16,107 @@
 # next.js
 /.next/
 /out/
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.db
+*.sqlite3
 
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Next.js
+.next/
+out/
+.vercel
+
+# Backend
+backend/venv/
+backend/__pycache__/
+backend/static/uploads/
+backend/static/reports/
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Misc
+*.pem
+*.log
+coverage/
+
+# Prisma
+frontend/prisma/*.db
+frontend/prisma/*.db-journal
+frontend/prisma/migrations/*.sql
+frontend/prisma/migrations/migration_lock.toml
+
+# Uploads
+frontend/public/uploads/
+
+# Agent files
+**/.agents/
+**/.claude/
+**/.windsurf/
+**/skills-lock.json
+
+# Build
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/dist/
+
+# Temporary
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Debug logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Local env files
+.env*.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Turbo
+.turbo
+EOF
 # production
 /build
 
